@@ -658,20 +658,12 @@ else:
     st.markdown("<div style='margin-top: 2rem;'></div>", unsafe_allow_html=True)
     
     if st.button(f"📄 Compile High-Fidelity PDF for {user_choice}", type="primary"):
-        with st.spinner("Spinning up rendering engine..."):
+        with st.spinner("Spinning up Playwright rendering engine..."):
             try:
-                st.info("DEBUG: Starting image conversion (Kaleido)...")
-                
-                # If it hangs here, Kaleido is the problem.
-                sig_b64 = fig_to_b64(sigmoid_position_chart(row['Growth_Index']), 650, 260)
-                st.success("DEBUG: Sigmoid chart converted!")
-                
-                st.info("DEBUG: Launching Playwright browser...")
-                
-                # If it hangs inside this function, Playwright is the problem.
+                # Pass the row data directly to the new HTML-based Playwright function
                 pdf_bytes = generate_user_pdf_playwright(row)
                 
-                st.success("DEBUG: PDF generated successfully!")
+                st.success("PDF rendered successfully!")
                 
                 st.download_button(
                     label="⬇️ Download PDF",
