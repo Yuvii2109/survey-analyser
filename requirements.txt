@@ -3,4 +3,4 @@ pandas
 plotly
 numpy
 playwright
-kaleido
+kaleido==0.1.*
