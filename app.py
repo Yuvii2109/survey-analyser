@@ -449,7 +449,7 @@ def generate_user_pdf_playwright(row):
     <body>
         <div class="pdf-container">
             <div class="sub-title" style="font-family: 'DM Mono', monospace; font-size: 0.75rem; color: #64748b; letter-spacing: 0.2em; text-transform: uppercase;">Your Strategic Report</div>
-            <h1 style="margin-top: 5px; margin-bottom: 15px;">{row['UserID']}</h1>
+            <h1 style="margin-top: 5px; margin-bottom: 15px;">{row['Display_Name']}</h1>
             
             <div class="status-row" style="margin-bottom: 35px;">
                 <span class="status-badge {badge_cls}">{label}</span>
@@ -577,7 +577,32 @@ else:
     raw = pd.read_csv(uploaded_file)
     q_cols = raw.columns[8:28]
     raw = raw.rename(columns={q_cols[i]: f'Q{i+1}' for i in range(len(q_cols))})
-    raw.insert(0, 'UserID', [f"User {i+1}" for i in range(len(raw))])
+    # --- START NEW NAME EXTRACTION LOGIC ---
+    if 'name' in raw.columns:
+        raw_names = raw['name'].fillna("Unknown").astype(str).tolist()
+    else:
+        try:
+            raw_names = raw.iloc[:, 29].fillna("Unknown").astype(str).tolist()
+        except IndexError:
+            raw_names = [f"User {i+1}" for i in range(len(raw))]
+            
+    # Clean names for the PDF (e.g., "John Doe")
+    display_names = [name.title().strip() for name in raw_names]
+            
+    # Unique IDs for the Streamlit dropdown (e.g., "John Doe (2)")
+    unique_ids = []
+    seen = {}
+    for name in display_names:
+        if name in seen:
+            seen[name] += 1
+            unique_ids.append(f"{name} ({seen[name]})")
+        else:
+            seen[name] = 1
+            unique_ids.append(name)
+            
+    raw.insert(0, 'UserID', unique_ids)
+    raw.insert(1, 'Display_Name', display_names)
+    # --- END NEW NAME EXTRACTION LOGIC ---
     
     for i in range(1, 21): raw[f'Q{i}'] = raw[f'Q{i}'].map(RESPONSE_MAP).fillna(3)
  
@@ -612,7 +637,7 @@ else:
             Individual Strategic Report
         </div>
         <div style='font-family: Playfair Display, serif; font-size: 2.8rem; font-weight: 900; color: #0f172a; line-height: 1.1; margin-bottom: 0.6rem;'>
-            {user_choice}
+            {row['Display_Name']}
         </div>
     </div>
     """, unsafe_allow_html=True)
