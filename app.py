@@ -15,7 +15,7 @@ def install_playwright():
     # Installs the browser
     os.system("playwright install chromium")
     # Installs the required Linux system dependencies for the browser
-    os.system("playwright install-deps chromium")
+    # os.system("playwright install-deps chromium")
 
 install_playwright()
 
@@ -222,6 +222,12 @@ def get_band(score):
         if lo <= score < hi: return label, css
     return "Benchmark", "band-benchmark"
 
+def fig_to_html(fig, w, h):
+    """Converts a Plotly figure to an embeddable HTML string."""
+    fig.update_layout(width=w, height=h, margin=dict(l=0, r=0, t=30, b=0)) # Tighten margins
+    # include_plotlyjs='cdn' pulls the rendering library directly into the HTML
+    return fig.to_html(full_html=False, include_plotlyjs='cdn')
+
 def fig_to_b64(fig, w, h):
     """Converts a Plotly figure to a base64 encoded PNG string."""
     img_bytes = fig.to_image(format="png", width=w, height=h, scale=2)
@@ -411,21 +417,18 @@ def growth_stage_focus_html():
 #  PLAYWRIGHT PDF GENERATOR ENGINE (SYNCHRONOUS & SINGLE PAGE)
 # ─────────────────────────────────────────────
 def generate_user_pdf_playwright(row):
-    """Generates a high-fidelity, perfectly scaled single-page PDF using Playwright."""
+    """Generates a high-fidelity, perfectly scaled single-page PDF using Playwright natively."""
     
-    # def fig_to_b64(fig, w, h):
-    #     img_bytes = fig.to_image(format="png", width=w, height=h, scale=2)
-    #     return base64.b64encode(img_bytes).decode('utf-8')
-        
-    # Scaled dimensions for better resolution and tighter packing
-    sig_b64 = fig_to_b64(sigmoid_position_chart(row['Growth_Index']), 650, 260)
-    g1_b64 = fig_to_b64(gauge_chart(row['Relevance'], "RELEVANCE", "#d97706"), 220, 160)
-    g2_b64 = fig_to_b64(gauge_chart(row['Reliability_Adj'], "RELIABILITY", "#2563eb"), 220, 160)
-    g3_b64 = fig_to_b64(gauge_chart(row['Reputability_Adj'], "REPUTABILITY", "#7c3aed"), 220, 160)
-    rad_b64 = fig_to_b64(radar_chart(row), 450, 360)
+    # 1. Generate HTML strings instead of Base64 images
+    sig_html = fig_to_html(sigmoid_position_chart(row['Growth_Index']), 650, 260)
+    g1_html = fig_to_html(gauge_chart(row['Relevance'], "RELEVANCE", "#d97706"), 220, 160)
+    g2_html = fig_to_html(gauge_chart(row['Reliability_Adj'], "RELIABILITY", "#2563eb"), 220, 160)
+    g3_html = fig_to_html(gauge_chart(row['Reputability_Adj'], "REPUTABILITY", "#7c3aed"), 220, 160)
+    rad_html = fig_to_html(radar_chart(row), 450, 360)
     
     label, badge_cls, desc = get_strategic_profile(row)
     
+    # 2. Inject the HTML directly (No <img> tags needed!)
     pdf_html = f"""
     <!DOCTYPE html>
     <html>
@@ -433,35 +436,14 @@ def generate_user_pdf_playwright(row):
         <meta charset="utf-8">
         <style>
             {CUSTOM_CSS}
-            
-            /* DYNAMIC HEIGHT OVERRIDES */
-            html, body {{
-                margin: 0 !important;
-                padding: 0 !important;
-                background: #ffffff;
-            }}
-            
-            /* The master container acts as the PDF boundary with internal padding */
-            .pdf-container {{
-                padding: 50px;
-                width: 100%;
-                box-sizing: border-box;
-            }}
-            
-            /* Destroy all pagination rules */
-            * {{
-                page-break-inside: avoid !important;
-                page-break-before: auto !important;
-                page-break-after: auto !important;
-            }}
-            
-            /* Refined Layout Formatting */
+            html, body {{ margin: 0 !important; padding: 0 !important; background: #ffffff; }}
+            .pdf-container {{ padding: 50px; width: 100%; box-sizing: border-box; }}
+            * {{ page-break-inside: avoid !important; page-break-before: auto !important; page-break-after: auto !important; }}
             .kpi-row {{ display: flex; gap: 20px; margin-bottom: 25px; align-items: stretch; }}
             .kpi-col {{ flex: 1; display: flex; flex-direction: column; }}
-            .chart-col {{ flex: 1.5; display: flex; justify-content: center; align-items: center; }}
-            
-            .gauge-row {{ display: flex; justify-content: space-around; margin-top: 15px; margin-bottom: 25px; }}
-            .gauge-row img {{ max-width: 32%; height: auto; }}
+            .chart-col {{ flex: 1.5; display: flex; justify-content: center; align-items: center; border: 1px solid #e2e8f0; border-radius: 12px; }}
+            .gauge-row {{ display: flex; justify-content: space-around; margin-top: 15px; margin-bottom: 25px; width: 100%; }}
+            .gauge-item {{ width: 32%; }}
         </style>
     </head>
     <body>
@@ -482,7 +464,7 @@ def generate_user_pdf_playwright(row):
                     </div>
                 </div>
                 <div class="chart-col">
-                    <img src="data:image/png;base64,{sig_b64}" style="max-width: 100%; border: 1px solid #e2e8f0; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.02);" />
+                    {sig_html}
                 </div>
             </div>
             
@@ -491,31 +473,23 @@ def generate_user_pdf_playwright(row):
             </div>
             
             <div class="gauge-row">
-                <img src="data:image/png;base64,{g1_b64}" />
-                <img src="data:image/png;base64,{g2_b64}" />
-                <img src="data:image/png;base64,{g3_b64}" />
+                <div class="gauge-item">{g1_html}</div>
+                <div class="gauge-item">{g2_html}</div>
+                <div class="gauge-item">{g3_html}</div>
             </div>
             
-            <div style="margin-top: 20px; margin-bottom: 40px;">
-                {score_explanation_html()}
-            </div>
+            <div style="margin-top: 20px; margin-bottom: 40px;">{score_explanation_html()}</div>
 
             <div class="section-header">
                 <span class="section-number">02</span><span class="section-title">Growth Stage Profile</span>
             </div>
             
             <div class="kpi-row" style="align-items: center;">
-                <div class="kpi-col">
-                    {stage_bar_html(row)}
-                </div>
-                <div class="chart-col">
-                    <img src="data:image/png;base64,{rad_b64}" style="max-width: 90%;" />
-                </div>
+                <div class="kpi-col">{stage_bar_html(row)}</div>
+                <div class="chart-col">{rad_html}</div>
             </div>
             
-            <div style="margin-top: 20px;">
-                {growth_stage_focus_html()}
-            </div>
+            <div style="margin-top: 20px;">{growth_stage_focus_html()}</div>
             
             <div style="margin-top: 50px; text-align: center; font-family: 'DM Mono', monospace; font-size: 10px; color: #94a3b8; text-transform: uppercase; border-top: 1px solid #e2e8f0; padding-top: 20px;">
                 R-Cube Strategic Intelligence · Edxso Analytics · Confidential Report
@@ -526,29 +500,25 @@ def generate_user_pdf_playwright(row):
     """
     
     with sync_playwright() as p:
-        # Essential flags for Streamlit Cloud / Linux environments
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox", 
-                "--disable-gpu", 
-                "--disable-dev-shm-usage",
-                "--single-process"
-            ]
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--single-process"]
         )
         context = browser.new_context()
         page = context.new_page()
         
+        # networkidle ensures Playwright waits for Plotly CDN to download and render
         page.set_content(pdf_html, wait_until="networkidle")
         
-        # Give extra time for Plotly images to render in the HTML
-        page.wait_for_timeout(1000) 
+        # Hard wait 2 seconds to let Plotly drawing animations finish
+        page.wait_for_timeout(2000) 
         
         exact_height = page.evaluate("document.documentElement.scrollHeight")
-        
+        adjusted_height = exact_height + 50
+
         pdf_bytes = page.pdf(
             width="1100px",
-            height=f"{exact_height}px",
+            height=f"{adjusted_height}px",
             print_background=True,
             margin={"top": "0", "right": "0", "bottom": "0", "left": "0"}
         )
