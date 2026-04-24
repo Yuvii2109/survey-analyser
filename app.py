@@ -4,13 +4,25 @@ import plotly.graph_objects as go
 import numpy as np
 import base64
 import io
-from playwright.sync_api import sync_playwright
 import sys
 import asyncio
 import warnings
-
-import plotly.io as pio
 import os
+
+# ─────────────────────────────────────────────
+#  WINDOWS EVENT LOOP FIX (MUST COME FIRST)
+# ─────────────────────────────────────────────
+if sys.platform == "win32":
+    # Mute the Python 3.14+ deprecation warnings to keep the console clean
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=DeprecationWarning)
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        except AttributeError:
+            pass # Failsafe just in case it gets fully removed in a future test build
+
+from playwright.sync_api import sync_playwright
+import plotly.io as pio
 
 # ─────────────────────────────────────────────
 #  STREAMLIT CLOUD PLAYWRIGHT INSTALLER
@@ -34,14 +46,6 @@ with sync_playwright() as p:
             ]
         )
         page = browser.new_page()
-
-# Set explicit headless parameters for Kaleido on Streamlit Cloud
-pio.kaleido.scope.chromium_args = (
-    "--headless",
-    "--no-sandbox",
-    "--single-process",
-    "--disable-gpu"
-)
 
 # ─────────────────────────────────────────────
 #  WINDOWS EVENT LOOP FIX (WITH WARNING MUTE)
@@ -196,6 +200,7 @@ st.markdown(f"<style>{CUSTOM_CSS}</style>", unsafe_allow_html=True)
 RESPONSE_MAP = {
     "Completely disagree": 1, "Disagree": 2,
     "Don't Know, Can't Say": 3, "don't know ,can't say": 3,
+    "Don’t Know, Can’t Say": 3,  # Added to handle CSV export typography
     "Agree": 4, "Completely agree": 5, "Completely Agree": 5,
 }
  
