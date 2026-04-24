@@ -9,6 +9,16 @@ import asyncio
 import warnings
 import os
 
+@st.cache_resource
+def install_playwright():
+    """Forces the Streamlit server to download the Chromium binary and dependencies on boot."""
+    # Installs the browser
+    os.system("playwright install chromium")
+    # Installs the required Linux system dependencies for the browser
+    os.system("playwright install-deps chromium")
+
+install_playwright()
+
 # ─────────────────────────────────────────────
 #  WINDOWS EVENT LOOP FIX (MUST COME FIRST)
 # ─────────────────────────────────────────────
