@@ -32,21 +32,6 @@ import plotly.io as pio
 def install_playwright():
     os.system("playwright install chromium")
 
-install_playwright()
-
-with sync_playwright() as p:
-        # Pass essential cloud-environment flags to prevent hanging
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage", # Forces Chromium to use /tmp instead of /dev/shm
-                "--single-process"
-            ]
-        )
-        page = browser.new_page()
-
 # ─────────────────────────────────────────────
 #  WINDOWS EVENT LOOP FIX (WITH WARNING MUTE)
 # ─────────────────────────────────────────────
@@ -526,27 +511,32 @@ def generate_user_pdf_playwright(row):
     """
     
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        # Essential flags for Streamlit Cloud / Linux environments
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox", 
+                "--disable-gpu", 
+                "--disable-dev-shm-usage",
+                "--single-process"
+            ]
+        )
+        context = browser.new_context()
+        page = context.new_page()
         
-        # 1. Set a fixed viewport width to calculate accurate layout heights
-        page.set_viewport_size({"width": 1100, "height": 800})
-        
-        # 2. Load the HTML and wait for everything to settle
         page.set_content(pdf_html, wait_until="networkidle")
         
-        # 3. DYNAMIC HEIGHT CALCULATION: Ask the DOM exactly how tall it is
+        # Give extra time for Plotly images to render in the HTML
+        page.wait_for_timeout(1000) 
+        
         exact_height = page.evaluate("document.documentElement.scrollHeight")
         
-        # 4. Generate the PDF using the calculated exact height, stripping native margins
         pdf_bytes = page.pdf(
             width="1100px",
             height=f"{exact_height}px",
             print_background=True,
-            page_ranges="1", # Force render as a single sheet
             margin={"top": "0", "right": "0", "bottom": "0", "left": "0"}
         )
-        
         browser.close()
         return pdf_bytes
 
