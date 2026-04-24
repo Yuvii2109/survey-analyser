@@ -9,6 +9,7 @@ import sys
 import asyncio
 import warnings
 
+import plotly.io as pio
 import os
 
 # ─────────────────────────────────────────────
@@ -20,6 +21,14 @@ def install_playwright():
     os.system("playwright install chromium")
 
 install_playwright()
+
+# Set explicit headless parameters for Kaleido on Streamlit Cloud
+pio.kaleido.scope.chromium_args = (
+    "--headless",
+    "--no-sandbox",
+    "--single-process",
+    "--disable-gpu"
+)
 
 # ─────────────────────────────────────────────
 #  WINDOWS EVENT LOOP FIX (WITH WARNING MUTE)
