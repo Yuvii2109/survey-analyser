@@ -211,7 +211,12 @@ def get_band(score):
     for (lo, hi), (label, css) in BAND_LABELS.items():
         if lo <= score < hi: return label, css
     return "Benchmark", "band-benchmark"
- 
+
+def fig_to_b64(fig, w, h):
+    """Converts a Plotly figure to a base64 encoded PNG string."""
+    img_bytes = fig.to_image(format="png", width=w, height=h, scale=2)
+    return base64.b64encode(img_bytes).decode('utf-8')
+
 def get_strategic_profile(row):
     gi = row['Growth_Index']
     rel  = row['Relevance']
@@ -398,9 +403,9 @@ def growth_stage_focus_html():
 def generate_user_pdf_playwright(row):
     """Generates a high-fidelity, perfectly scaled single-page PDF using Playwright."""
     
-    def fig_to_b64(fig, w, h):
-        img_bytes = fig.to_image(format="png", width=w, height=h, scale=2)
-        return base64.b64encode(img_bytes).decode('utf-8')
+    # def fig_to_b64(fig, w, h):
+    #     img_bytes = fig.to_image(format="png", width=w, height=h, scale=2)
+    #     return base64.b64encode(img_bytes).decode('utf-8')
         
     # Scaled dimensions for better resolution and tighter packing
     sig_b64 = fig_to_b64(sigmoid_position_chart(row['Growth_Index']), 650, 260)
@@ -675,8 +680,18 @@ else:
     if st.button(f"📄 Compile High-Fidelity PDF for {user_choice}", type="primary"):
         with st.spinner("Spinning up rendering engine..."):
             try:
-                # Trigger the synchronous generation function directly
+                st.info("DEBUG: Starting image conversion (Kaleido)...")
+                
+                # If it hangs here, Kaleido is the problem.
+                sig_b64 = fig_to_b64(sigmoid_position_chart(row['Growth_Index']), 650, 260)
+                st.success("DEBUG: Sigmoid chart converted!")
+                
+                st.info("DEBUG: Launching Playwright browser...")
+                
+                # If it hangs inside this function, Playwright is the problem.
                 pdf_bytes = generate_user_pdf_playwright(row)
+                
+                st.success("DEBUG: PDF generated successfully!")
                 
                 st.download_button(
                     label="⬇️ Download PDF",
