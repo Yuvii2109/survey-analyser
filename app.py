@@ -22,6 +22,19 @@ def install_playwright():
 
 install_playwright()
 
+with sync_playwright() as p:
+        # Pass essential cloud-environment flags to prevent hanging
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage", # Forces Chromium to use /tmp instead of /dev/shm
+                "--single-process"
+            ]
+        )
+        page = browser.new_page()
+
 # Set explicit headless parameters for Kaleido on Streamlit Cloud
 pio.kaleido.scope.chromium_args = (
     "--headless",
