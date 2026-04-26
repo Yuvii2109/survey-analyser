@@ -2,6 +2,7 @@ import base64
 import os
 from typing import List
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 import requests
@@ -74,8 +75,6 @@ EMAIL_TEMPLATE = """\
     <p>
       Thank you once again for your valuable participation.
     </p>
-
-    <br>
 
     <p>
       Warm regards,<br>
@@ -153,7 +152,10 @@ def send_email_with_attachment(email: str, name: str, file_name: str, file_bytes
     )
 
 
-def send_pending_reports_from_dataframe(raw_df: pd.DataFrame) -> List[dict]:
+def send_pending_reports_from_dataframe(
+    raw_df: pd.DataFrame,
+    progress_callback: Callable[[int, int, str, str], None] | None = None,
+) -> List[dict]:
     run_log = []
 
     if raw_df.empty:
@@ -164,15 +166,23 @@ def send_pending_reports_from_dataframe(raw_df: pd.DataFrame) -> List[dict]:
     email_col = find_column_name(raw_df, ["email", "email address", "email_address", "mail"])
     name_col = find_column_name(raw_df, ["name", "full name", "full_name", "participant name"])
     status_col = find_column_name(raw_df, ["status", "mail status", "email status"])
+    pending_targets = []
 
     for row_idx, report_row in results.iterrows():
         source_row = raw_df.iloc[row_idx]
         email = get_series_value(source_row, COL_EMAIL, email_col)
-        name = get_series_value(source_row, COL_NAME, name_col, report_row["Display_Name"])
         status = get_series_value(source_row, COL_STATUS, status_col, "Pending")
+        if email and status == "Pending":
+            pending_targets.append((row_idx, report_row))
 
-        if not email or status != "Pending":
-            continue
+    total_targets = len(pending_targets)
+
+    for position, (row_idx, report_row) in enumerate(pending_targets, start=1):
+        source_row = raw_df.iloc[row_idx]
+        email = get_series_value(source_row, COL_EMAIL, email_col)
+        name = get_series_value(source_row, COL_NAME, name_col, report_row["Display_Name"])
+        if progress_callback is not None:
+            progress_callback(position, total_targets, report_row["Display_Name"], "sending")
 
         try:
             pdf_bytes = generate_user_pdf_playwright(report_row)
@@ -187,6 +197,8 @@ def send_pending_reports_from_dataframe(raw_df: pd.DataFrame) -> List[dict]:
                 run_log.append(
                     {"status": "success", "message": f"Sent to {email}", "row_index": row_idx}
                 )
+                if progress_callback is not None:
+                    progress_callback(position, total_targets, report_row["Display_Name"], "sent")
             else:
                 run_log.append(
                     {
@@ -198,6 +210,8 @@ def send_pending_reports_from_dataframe(raw_df: pd.DataFrame) -> List[dict]:
                         "row_index": row_idx,
                     }
                 )
+                if progress_callback is not None:
+                    progress_callback(position, total_targets, report_row["Display_Name"], "error")
         except Exception as exc:
             run_log.append(
                 {
@@ -206,6 +220,8 @@ def send_pending_reports_from_dataframe(raw_df: pd.DataFrame) -> List[dict]:
                     "row_index": row_idx,
                 }
             )
+            if progress_callback is not None:
+                progress_callback(position, total_targets, report_row["Display_Name"], "error")
 
     if not run_log:
         run_log.append({"status": "info", "message": "No rows with Pending status were found."})

@@ -4,3 +4,6 @@ plotly
 numpy
 playwright
 requests
+google-genai
+python-dotenv
+fpdf2
