@@ -11,6 +11,8 @@ import warnings
 import os
 import json
 import re
+import html
+import zipfile
 from pathlib import Path
 import requests
 
@@ -32,10 +34,21 @@ except Exception:
     XPos = None
     YPos = None
 
+try:
+    from playwright.sync_api import sync_playwright
+except Exception as playwright_import_error:
+    sync_playwright = None
+    PLAYWRIGHT_IMPORT_ERROR = playwright_import_error
+else:
+    PLAYWRIGHT_IMPORT_ERROR = None
+
 @st.cache_resource
 def install_playwright():
     """Forces the Streamlit server to download the Chromium binary and dependencies on boot."""
+    if sync_playwright is None:
+        return False
     os.system("playwright install chromium")
+    return True
 
 # ─────────────────────────────────────────────
 #  WINDOWS EVENT LOOP FIX (MUST COME FIRST)
@@ -49,7 +62,6 @@ if sys.platform == "win32":
         except AttributeError:
             pass # Failsafe just in case it gets fully removed in a future test build
 
-from playwright.sync_api import sync_playwright
 import plotly.io as pio
 from plotly.offline import get_plotlyjs
 
@@ -59,6 +71,16 @@ APP_PAGE_CONFIG = dict(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+st.set_page_config(**APP_PAGE_CONFIG)
+
+
+def ensure_playwright_ready():
+    if sync_playwright is None:
+        raise RuntimeError(
+            "Playwright is not installed in this Python environment. "
+            "Install it with `pip install playwright` and then run `playwright install chromium`."
+        ) from PLAYWRIGHT_IMPORT_ERROR
 
 
 def load_local_env(env_path: str = ".env") -> None:
@@ -206,6 +228,37 @@ h1, h2, h3 { font-family: 'Playfair Display', serif !important; color: #0f172a !
 
 /* Divider */
 hr { border-color: #e2e8f0 !important; }
+
+.stButton > button,
+.stDownloadButton > button {
+    background: #2563eb !important;
+    color: #ffffff !important;
+    border: 1px solid #2563eb !important;
+}
+.stButton > button p,
+.stButton > button span,
+.stDownloadButton > button p,
+.stDownloadButton > button span,
+[data-testid="stSidebar"] .stButton > button,
+[data-testid="stSidebar"] .stButton > button p,
+[data-testid="stSidebar"] .stButton > button span,
+[data-testid="stSidebar"] .stDownloadButton > button,
+[data-testid="stSidebar"] .stDownloadButton > button p,
+[data-testid="stSidebar"] .stDownloadButton > button span {
+    color: #ffffff !important;
+}
+.stButton > button:hover,
+.stDownloadButton > button:hover {
+    background: #1d4ed8 !important;
+    color: #ffffff !important;
+    border-color: #1d4ed8 !important;
+}
+.stButton > button:disabled,
+.stDownloadButton > button:disabled {
+    background: #93c5fd !important;
+    color: #eff6ff !important;
+    border-color: #93c5fd !important;
+}
 """
 
 # ─────────────────────────────────────────────
@@ -243,7 +296,7 @@ def get_band(score):
 
 def fig_to_html(fig, w, h):
     """Converts a Plotly figure to an embeddable HTML string."""
-    fig.update_layout(width=w, height=h, margin=dict(l=0, r=0, t=30, b=0)) # Tighten margins
+    fig.update_layout(width=w, height=h)
     return fig.to_html(full_html=False, include_plotlyjs=False)
 
 def fig_to_b64(fig, w, h):
@@ -320,9 +373,104 @@ def prepare_results(raw):
     raw.insert(1, 'Display_Name', display_names)
 
     for i in range(1, 21):
-        raw[f'Q{i}'] = raw[f'Q{i}'].map(RESPONSE_MAP).fillna(3)
+        q_key = f'Q{i}'
+        if q_key not in raw.columns:
+            raw[q_key] = 3
+        else:
+            raw[q_key] = raw[q_key].map(RESPONSE_MAP).fillna(3)
 
     return calculate_metrics(raw)
+
+
+def make_unique_display_names(raw_names):
+    def _clean_name(name, fallback_index):
+        text = str(name or "").strip()
+        if not text or text.lower() in {"nan", "none", "null", "unknown"}:
+            return f"User {fallback_index}"
+        return text.title()
+
+    display_names = [_clean_name(name, index + 1) for index, name in enumerate(raw_names)]
+    unique_ids = []
+    seen = {}
+    for name in display_names:
+        if name in seen:
+            seen[name] += 1
+            unique_ids.append(f"{name} ({seen[name]})")
+        else:
+            seen[name] = 1
+            unique_ids.append(name)
+    return display_names, unique_ids
+
+
+def resolve_record_display_name(record, fallback="Participant"):
+    candidate_keys = ["name", "Display_Name", "display_name", "UserID", "user_id"]
+    for key in candidate_keys:
+        try:
+            value = record.get(key) if hasattr(record, "get") else None
+        except Exception:
+            value = None
+        text = str(value or "").strip()
+        if text and text.lower() not in {"nan", "none", "null", "unknown"}:
+            return text
+
+    email_value = ""
+    try:
+        email_value = str((record.get("email") if hasattr(record, "get") else "") or (record.get("Email") if hasattr(record, "get") else "")).strip()
+    except Exception:
+        email_value = ""
+    if email_value and "@" in email_value:
+        return email_value.split("@", 1)[0]
+
+    return fallback
+
+
+def find_email_column(df):
+    return find_column_name(df, ["email", "email address", "email_address", "mail"])
+
+
+def find_name_column(df):
+    return find_column_name(df, ["name", "full name", "full_name", "participant name", "teacher name"])
+
+
+def infer_single_survey_kind(raw):
+    pre_matches = sum(1 for question in PRE_ASSESSMENT_KEY if get_matched_column(raw, question))
+    post_matches = sum(1 for question in POST_ASSESSMENT_KEY if get_matched_column(raw, question))
+    if pre_matches >= 8 and pre_matches >= post_matches:
+        return "pre_assessment"
+    if post_matches >= 8 and post_matches > pre_matches:
+        return "post_assessment"
+    return "rcube"
+
+
+def prepare_assessment_results(raw, base_answer_key, current_api_key):
+    raw = raw.copy()
+    dynamic_answer_key = build_dynamic_answer_mapping(raw, base_answer_key, current_api_key)
+    scored = generate_individual_graded_dataframe(raw, dynamic_answer_key)
+
+    name_col = find_name_column(raw)
+    email_col = find_email_column(raw)
+    phone_col = find_phone_column(raw)
+
+    raw_names = (
+        raw[name_col].fillna("Unknown").astype(str).tolist()
+        if name_col is not None
+        else [f"User {i+1}" for i in range(len(raw))]
+    )
+    display_names, user_ids = make_unique_display_names(raw_names)
+
+    scored.insert(0, "UserID", user_ids)
+    scored.insert(1, "Display_Name", display_names)
+    scored["Email"] = (
+        raw[email_col].fillna("").astype(str).str.strip()
+        if email_col is not None
+        else pd.Series([""] * len(raw))
+    )
+    scored["Phone"] = (
+        raw[phone_col].apply(normalize_phone)
+        if phone_col is not None
+        else pd.Series([""] * len(raw))
+    )
+    return scored, dynamic_answer_key
 
 
 def find_column_name(df, candidates):
@@ -370,6 +518,113 @@ def get_row_contact_details(raw, results, user_id):
     return {"email": email, "name": name}
 
 
+def get_comparison_contact_details(pre_df, post_df, phone, participant_name):
+    email_candidates = ["email", "email address", "email_address", "mail"]
+    name_candidates = ["name", "full name", "participant name", "teacher name"]
+
+    def extract_contact(df):
+        if df is None or df.empty:
+            return {"email": "", "name": ""}
+        phone_col = find_phone_column(df)
+        if phone_col is None:
+            return {"email": "", "name": ""}
+        matches = df[df[phone_col].apply(normalize_phone) == phone]
+        if matches.empty:
+            return {"email": "", "name": ""}
+        source_row = matches.iloc[0]
+        email_col = find_column_name(df, email_candidates)
+        name_col = find_column_name(df, name_candidates)
+        email = ""
+        name = ""
+        if email_col is not None:
+            value = source_row[email_col]
+            email = "" if pd.isna(value) else str(value).strip()
+        if name_col is not None:
+            value = source_row[name_col]
+            name = "" if pd.isna(value) else str(value).strip()
+        return {"email": email, "name": name}
+
+    pre_contact = extract_contact(pre_df)
+    post_contact = extract_contact(post_df)
+    return {
+        "email": pre_contact["email"] or post_contact["email"],
+        "name": pre_contact["name"] or post_contact["name"] or participant_name,
+    }
+
+
+def build_comparison_pdf_filename(name):
+    safe_name = "_".join(str(name or "Participant").split())
+    return f"PrePost_Comparison_{safe_name}.pdf"
+
+
+def build_question_short_labels(base_answer_key):
+    labels = []
+    for index, question in enumerate(base_answer_key.keys(), start=1):
+        cleaned = re.sub(r"\s+", " ", str(question)).strip().rstrip(":?.")
+        if len(cleaned) > 72:
+            cleaned = cleaned[:69].rstrip() + "..."
+        labels.append({"id": f"Q{index}", "text": cleaned})
+    return labels
+
+
+def render_panel_header(eyebrow, title, subtitle):
+    st.markdown(
+        f"""
+        <div style="margin-bottom: 1.25rem;">
+            <div style="font-family: 'DM Mono', monospace; font-size: 0.72rem; color: #64748b; letter-spacing: 0.18em; text-transform: uppercase; margin-bottom: 0.35rem;">
+                {eyebrow}
+            </div>
+            <div style="font-family: 'Playfair Display', serif; font-size: 2.35rem; font-weight: 900; color: #0f172a; line-height: 1.1; margin-bottom: 0.4rem;">
+                {title}
+            </div>
+            <div style="font-size: 1rem; color: #475569; max-width: 760px; line-height: 1.7;">
+                {subtitle}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_info_card(title, body):
+    st.markdown(
+        f"""
+        <div class="explain-wrap" style="margin-bottom: 1rem;">
+            <div class="explain-sub">{title}</div>
+            <div style="color:#334155; line-height:1.7;">{body}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_small_metric(label, value, help_text=""):
+    hint_html = (
+        f"<div style='font-size:0.86rem; color:#64748b; margin-top:0.4rem;'>{help_text}</div>"
+        if help_text
+        else ""
+    )
+    st.markdown(
+        f"""
+        <div style="background:#ffffff; border:1px solid #e2e8f0; border-radius:12px; padding:1rem 1.1rem; height:100%;">
+            <div style="font-family:'DM Mono', monospace; font-size:0.66rem; color:#64748b; letter-spacing:0.16em; text-transform:uppercase; margin-bottom:0.35rem;">
+                {label}
+            </div>
+            <div style="font-family:'Playfair Display', serif; font-size:1.85rem; font-weight:900; color:#0f172a; line-height:1.1;">
+                {value}
+            </div>
+            {hint_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_progress_metric(panel, current, total):
+    with panel.container():
+        render_small_metric("PDF Progress", f"{current} / {total}")
+
+
 def ensure_generated_pdf_dir(library_key=None):
     GENERATED_PDF_DIR.mkdir(exist_ok=True)
     if library_key:
@@ -393,22 +648,237 @@ def get_library_paths(library_key):
     return library_dir, library_dir / "index.json"
 
 
-def load_generated_pdf_library(library_key):
-    _, index_path = get_library_paths(library_key)
-    if not index_path.exists():
+def get_library_meta_path(library_key):
+    library_dir, _ = get_library_paths(library_key)
+    return library_dir / "meta.json"
+
+
+def infer_report_type(library_key, source_name=""):
+    text = f"{library_key} {source_name}".lower()
+    comparison_markers = [
+        "comparison",
+        "pre-post",
+        "pre_post",
+        "-pre-",
+        "-post-",
+        " vs ",
+    ]
+    if any(marker in text for marker in comparison_markers):
+        return "comparison"
+    return "single"
+
+
+def infer_source_name_from_library_key(library_key):
+    match = re.match(r"^(.*)-([0-9a-f]{12})$", library_key)
+    base = match.group(1) if match else library_key
+    if base.endswith("-csv"):
+        return base[:-4].replace("-", "_") + ".csv"
+    return base.replace("-", "_")
+
+
+def persist_library_meta(library_key, source_name="", report_type="single"):
+    meta_path = get_library_meta_path(library_key)
+    payload = {
+        "library_key": library_key,
+        "source_name": source_name or library_key,
+        "report_type": report_type,
+    }
+    meta_path.write_text(json.dumps(payload, indent=2))
+
+
+def load_library_meta(library_key):
+    meta_path = get_library_meta_path(library_key)
+    if meta_path.exists():
+        try:
+            payload = json.loads(meta_path.read_text())
+            payload.setdefault(
+                "report_type",
+                infer_report_type(library_key, payload.get("source_name", library_key)),
+            )
+            return payload
+        except Exception:
+            pass
+    return {
+        "library_key": library_key,
+        "source_name": infer_source_name_from_library_key(library_key),
+        "report_type": infer_report_type(library_key, library_key),
+    }
+
+
+def build_pdf_record_from_file(pdf_path):
+    user_label = pdf_path.stem.replace("RCube_Report_", "").replace("PrePost_Comparison_", "")
+    user_label = user_label.replace("_", " ").strip() or pdf_path.stem
+    return {
+        "file_name": pdf_path.name,
+        "file_path": str(pdf_path.resolve()),
+        "email": "",
+        "name": user_label,
+    }
+
+
+def normalize_person_label(value):
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def load_legacy_root_manifest():
+    root_manifest = GENERATED_PDF_DIR / "index.json"
+    if not root_manifest.exists():
         return {}
+    try:
+        return json.loads(root_manifest.read_text())
+    except Exception:
+        return {}
+
+
+def find_source_csv_candidates(source_name):
+    if not source_name:
+        return []
+    candidates = []
+    search_roots = [
+        Path.cwd(),
+        Path("/Users/ritu/Downloads"),
+        Path("/Users/ritu/Desktop"),
+    ]
+    for root in search_roots:
+        try:
+            direct = root / source_name
+            if direct.exists():
+                candidates.append(direct)
+            for match in root.glob(f"**/{source_name}"):
+                if match.exists() and match not in candidates:
+                    candidates.append(match)
+        except Exception:
+            continue
+    return candidates
+
+
+def get_edxso_logo_data_uri():
+    candidates = [
+        Path("/Users/ritu/Documents/GitHub/landing-page-mu/public/EDXSO.png"),
+        Path("/Users/ritu/Documents/GitHub/landing-page/public/EDXSO.png"),
+        Path("/Users/ritu/Documents/GitHub/edxso-login-redirect/src/assets/edxso-logo.png"),
+        Path("/Users/ritu/Documents/GitHub/connect-edify-event/src/assets/edxso-logo.png"),
+        Path("/Users/ritu/Documents/GitHub/Spark-Edxso/studentreport/edxso-logo.png"),
+    ]
+    mime_types = {
+        ".png": "image/png",
+        ".ico": "image/x-icon",
+    }
+    for path in candidates:
+        try:
+            if path.exists():
+                encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+                mime_type = mime_types.get(path.suffix.lower(), "application/octet-stream")
+                return f"data:{mime_type};base64,{encoded}"
+        except Exception:
+            continue
+    return ""
+
+
+def build_email_lookup_from_csv(csv_path):
+    try:
+        raw = pd.read_csv(csv_path)
+    except Exception:
+        return {}
+    try:
+        results = prepare_results(raw)
+    except Exception:
+        return {}
+
+    lookup = {}
+    for _, result_row in results.iterrows():
+        user_id = result_row["UserID"]
+        display_name = result_row["Display_Name"]
+        contact = get_row_contact_details(raw, results, user_id)
+        for key in {normalize_person_label(user_id), normalize_person_label(display_name)}:
+            if key:
+                lookup[key] = contact
+    return lookup
+
+
+def backfill_library_contacts(library_key, library):
+    if not library:
+        return library
+
+    meta = load_library_meta(library_key)
+    report_type = meta.get("report_type", "single")
+    if report_type != "single":
+        return library
+
+    updated = False
+    legacy_manifest = load_legacy_root_manifest()
+    legacy_lookup = {
+        normalize_person_label(name): record for name, record in legacy_manifest.items()
+    }
+
+    csv_lookup = {}
+    source_name = meta.get("source_name", infer_source_name_from_library_key(library_key))
+    for candidate in find_source_csv_candidates(source_name):
+        csv_lookup = build_email_lookup_from_csv(candidate)
+        if csv_lookup:
+            break
+
+    for user_id, record in library.items():
+        if record.get("email"):
+            continue
+        normalized = normalize_person_label(record.get("name", user_id))
+        legacy_record = legacy_lookup.get(normalized, {})
+        csv_record = csv_lookup.get(normalized, {})
+        email = csv_record.get("email") or legacy_record.get("email") or ""
+        name = csv_record.get("name") or legacy_record.get("name") or record.get("name", user_id)
+        if email or name != record.get("name", user_id):
+            record["email"] = email
+            record["name"] = name
+            updated = True
+
+    if updated:
+        persist_generated_pdf_library(library, library_key)
+        if not get_library_meta_path(library_key).exists():
+            persist_library_meta(library_key, source_name, report_type="single")
+    return library
+
+
+def recover_generated_pdf_library_from_files(library_key):
+    library_dir, _ = get_library_paths(library_key)
+    recovered_library = {}
+    for pdf_path in sorted(library_dir.glob("*.pdf")):
+        record = build_pdf_record_from_file(pdf_path)
+        recovered_library[record["name"]] = record
+    return recovered_library
+
+
+def load_generated_pdf_library(library_key):
+    library_dir, index_path = get_library_paths(library_key)
+    if not index_path.exists():
+        recovered_library = recover_generated_pdf_library_from_files(library_key)
+        if recovered_library:
+            persist_generated_pdf_library(recovered_library, library_key)
+        return recovered_library
 
     try:
         records = json.loads(index_path.read_text())
     except Exception:
-        return {}
+        recovered_library = recover_generated_pdf_library_from_files(library_key)
+        if recovered_library:
+            persist_generated_pdf_library(recovered_library, library_key)
+        return recovered_library
 
     library = {}
     for user_id, record in records.items():
         file_path = record.get("file_path", "")
         if file_path and Path(file_path).exists():
             library[user_id] = record
-    return library
+
+    recovered_library = recover_generated_pdf_library_from_files(library_key)
+    updated = False
+    for recovered_name, recovered_record in recovered_library.items():
+        recovered_path = recovered_record["file_path"]
+        if not any(record.get("file_path") == recovered_path for record in library.values()):
+            library[recovered_name] = recovered_record
+            updated = True
+    if updated:
+        persist_generated_pdf_library(library, library_key)
+    return backfill_library_contacts(library_key, library)
 
 
 def persist_generated_pdf_library(library, library_key):
@@ -445,62 +915,231 @@ def clear_generated_pdf_library(library_key):
     index_path.write_text("{}")
 
 
-def render_generated_pdf_library(container):
+def build_library_zip_bytes(records):
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for _, record in records.items():
+            file_path = Path(record["file_path"])
+            if file_path.exists():
+                zf.write(file_path, arcname=record["file_name"])
+    return zip_buffer.getvalue()
+
+
+def list_all_pdf_libraries(report_type=None):
+    root = ensure_generated_pdf_dir()
+    libraries = []
+    for child in sorted(root.iterdir(), key=lambda path: path.name):
+        if not child.is_dir():
+            continue
+        library_key = child.name
+        records = load_generated_pdf_library(library_key)
+        meta = load_library_meta(library_key)
+        library_report_type = meta.get("report_type", "single")
+        if report_type is not None and library_report_type != report_type:
+            continue
+        libraries.append(
+            {
+                "library_key": library_key,
+                "source_name": meta.get("source_name", library_key),
+                "report_type": library_report_type,
+                "records": records,
+            }
+        )
+    libraries = [item for item in libraries if item["records"]]
+    libraries.sort(key=lambda item: item["source_name"].lower())
+    return libraries
+
+
+def render_generated_pdf_library(container, report_type="single"):
     with container.container():
-        if not st.session_state.generated_pdfs:
-            st.info("No PDFs have been generated yet for this uploaded list.")
+        all_libraries = list_all_pdf_libraries(report_type=report_type)
+        if not all_libraries:
+            st.info("No PDFs have been generated yet for this report type.")
             return
 
         st.markdown(section_header("04", "Generated PDFs"), unsafe_allow_html=True)
-        st.caption(f"Saved for this uploaded list: {len(st.session_state.generated_pdfs)}")
-        for pdf_user, pdf_info in st.session_state.generated_pdfs.items():
-            label_col, download_col, send_col = st.columns([1.4, 1, 1])
-            with label_col:
-                st.markdown(
-                    f"""
-                    <div class="explain-wrap" style="margin-bottom: 0.75rem;">
-                        <div class="explain-sub">Generated Report</div>
-                        <div style="font-size:1rem; color:#0f172a; font-weight:700;">{pdf_user}</div>
-                        <div style="font-size:0.9rem; color:#64748b; margin-top:0.35rem;">{pdf_info['file_name']}</div>
-                        <div style="font-size:0.85rem; color:#64748b; margin-top:0.25rem;">{pdf_info.get('email', 'No email found')}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            with download_col:
-                st.download_button(
-                    label="Download Report",
-                    data=Path(pdf_info["file_path"]).read_bytes(),
-                    file_name=pdf_info["file_name"],
-                    mime="application/pdf",
-                    use_container_width=True,
-                    key=f"download_{pdf_user}",
-                )
-            with send_col:
-                send_disabled = not pdf_info.get("email")
-                if st.button(
-                    "Send Email",
-                    use_container_width=True,
-                    key=f"send_{pdf_user}",
-                    disabled=send_disabled,
-                ):
-                    try:
-                        from send_pending_reports import send_email_with_attachment
+        current_library_key = st.session_state.get("current_library_key")
+        current_library_size = len(st.session_state.generated_pdfs)
+        if current_library_key:
+            current_meta = load_library_meta(current_library_key)
+            st.caption(
+                f"Current uploaded survey: {current_meta.get('source_name', current_library_key)}"
+            )
+            st.caption(f"Saved for current survey: {current_library_size}")
 
-                        response = send_email_with_attachment(
-                            email=pdf_info["email"],
-                            name=pdf_info.get("name", pdf_user),
+        for library in all_libraries:
+            library_key = library["library_key"]
+            records = library["records"]
+            is_current = library_key == current_library_key
+            survey_title = library["source_name"]
+            survey_label = "Current Survey" if is_current else "Previous Survey"
+            expander_label = f"{survey_title} ({len(records)} reports)"
+            with st.expander(expander_label, expanded=is_current):
+                header_info_col, download_col, delete_col = st.columns([10, 1, 1])
+                with header_info_col:
+                    st.caption(survey_label)
+                with download_col:
+                    st.download_button(
+                        "🗂",
+                        data=build_library_zip_bytes(records),
+                        file_name=f"{Path(survey_title).stem}_reports.zip",
+                        mime="application/zip",
+                        help=f"Download all reports for {survey_title} as a ZIP file",
+                        key=f"download_zip_{library_key}",
+                    )
+                with delete_col:
+                    if st.button(
+                        "🗑",
+                        help=f"Delete all generated reports for {survey_title}",
+                        key=f"delete_library_{library_key}",
+                    ):
+                        clear_generated_pdf_library(library_key)
+                        if library_key == current_library_key:
+                            st.session_state.generated_pdfs = {}
+                        st.success(f"Deleted all generated reports for {survey_title}.")
+                        st.rerun()
+
+                if not records:
+                    st.info("No PDFs are saved for this survey yet.")
+                    continue
+
+                for pdf_user, pdf_info in records.items():
+                    pdf_label = resolve_record_display_name(
+                        {"name": pdf_info.get("name", ""), "email": pdf_info.get("email", ""), "UserID": pdf_user},
+                        fallback=pdf_user,
+                    )
+                    label_col, download_col, send_col = st.columns([1.4, 1, 1])
+                    with label_col:
+                        st.markdown(
+                            f"""
+                            <div class="explain-wrap" style="margin-bottom: 0.75rem;">
+                                <div class="explain-sub">Generated Report</div>
+                                <div style="font-size:1rem; color:#0f172a; font-weight:700;">{pdf_label}</div>
+                                <div style="font-size:0.9rem; color:#64748b; margin-top:0.35rem;">{pdf_info['file_name']}</div>
+                                <div style="font-size:0.85rem; color:#64748b; margin-top:0.25rem;">{pdf_info.get('email', 'No email found')}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                    with download_col:
+                        st.download_button(
+                            label="Download Report",
+                            data=Path(pdf_info["file_path"]).read_bytes(),
                             file_name=pdf_info["file_name"],
-                            file_bytes=Path(pdf_info["file_path"]).read_bytes(),
+                            mime="application/pdf",
+                            use_container_width=True,
+                            key=f"download_{library_key}_{pdf_user}",
+                        )
+                    with send_col:
+                        send_disabled = not pdf_info.get("email")
+                        if st.button(
+                            "Send Email",
+                            use_container_width=True,
+                            key=f"send_{library_key}_{pdf_user}",
+                            disabled=send_disabled,
+                        ):
+                            try:
+                                from send_pending_reports import send_email_with_attachment
+
+                                response = send_email_with_attachment(
+                                    email=pdf_info["email"],
+                                    name=pdf_label,
+                                    file_name=pdf_info["file_name"],
+                                    file_bytes=Path(pdf_info["file_path"]).read_bytes(),
+                                )
+                                if response.status_code in (200, 201):
+                                    st.success(f"Sent {pdf_label} to {pdf_info['email']}")
+                                else:
+                                    st.error(
+                                        f"Failed for {pdf_label} ({response.status_code}): {response.text[:200]}"
+                                    )
+                            except Exception as e:
+                                st.error(f"Send failed for {pdf_label}: {e}")
+
+
+def render_saved_library_bulk_email_panel(report_type, key_prefix):
+    libraries = list_all_pdf_libraries(report_type=report_type)
+    if not libraries:
+        st.info("No generated PDF libraries are available for bulk email yet.")
+        return
+
+    progress_panel = st.empty()
+    status_panel = st.empty()
+    log_panel = st.empty()
+
+    for library in libraries:
+        email_ready_records = {
+            user_id: record
+            for user_id, record in library["records"].items()
+            if record.get("email") and Path(record["file_path"]).exists()
+        }
+        card_col, action_col = st.columns([1.4, 1])
+        with card_col:
+            st.markdown(
+                f"""
+                <div class="explain-wrap" style="margin-bottom: 0.75rem;">
+                    <div class="explain-sub">Saved Survey</div>
+                    <div style="font-size:1rem; color:#0f172a; font-weight:700;">{library['source_name']}</div>
+                    <div style="font-size:0.9rem; color:#64748b; margin-top:0.35rem;">Generated reports: {len(library['records'])}</div>
+                    <div style="font-size:0.85rem; color:#64748b; margin-top:0.25rem;">Email-ready reports: {len(email_ready_records)}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with action_col:
+            send_bulk_for_library = st.button(
+                "Send Bulk Emails For This Survey",
+                use_container_width=True,
+                disabled=not email_ready_records,
+                key=f"{key_prefix}_bulk_send_{library['library_key']}",
+            )
+
+        if send_bulk_for_library:
+            try:
+                from send_pending_reports import send_email_with_attachment
+
+                sent_count = 0
+                failed_count = 0
+                run_log = []
+                total_targets = len(email_ready_records)
+
+                for index, (user_id, record) in enumerate(email_ready_records.items(), start=1):
+                    status_panel.info(f"{index}/{total_targets}: Sending {user_id}")
+                    progress_panel.progress(
+                        index / max(total_targets, 1),
+                        text=f"Sending emails: {index}/{total_targets}",
+                    )
+                    try:
+                        response = send_email_with_attachment(
+                            email=record["email"],
+                            name=record.get("name", user_id),
+                            file_name=record["file_name"],
+                            file_bytes=Path(record["file_path"]).read_bytes(),
                         )
                         if response.status_code in (200, 201):
-                            st.success(f"Sent {pdf_user} to {pdf_info['email']}")
+                            sent_count += 1
+                            run_log.append(f"Sent: {user_id} ({record['email']})")
                         else:
-                            st.error(
-                                f"Failed for {pdf_user} ({response.status_code}): {response.text[:200]}"
-                            )
+                            failed_count += 1
+                            run_log.append(f"Failed: {user_id} ({response.status_code})")
                     except Exception as e:
-                        st.error(f"Send failed for {pdf_user}: {e}")
+                        failed_count += 1
+                        run_log.append(f"Failed: {user_id} ({e})")
+
+                st.session_state.email_batch_log = run_log
+                if sent_count:
+                    st.success(f"Sent {sent_count} email(s) from {library['source_name']}.")
+                if failed_count:
+                    st.error(f"{failed_count} email(s) failed for {library['source_name']}.")
+                status_panel.success(
+                    f"Completed email run for {library['source_name']}: {sent_count} sent, {failed_count} failed."
+                )
+                with log_panel.container():
+                    st.markdown("**Recent Email Activity**")
+                    for line in run_log[-10:]:
+                        st.write(f"- {line}")
+            except Exception as e:
+                st.error(f"Bulk email failed for {library['source_name']}: {e}")
 
 
 PRE_ASSESSMENT_KEY = {
@@ -532,6 +1171,10 @@ POST_ASSESSMENT_KEY = {
     "A teacher has supported a student in class, checked in privately, and still sees persistent distress. What should the teacher conclude?": "the concern may need referral support",
     "Which statement best reflects the spirit of the workshop?": "teachers support mental health through daily practice",
 }
+
+
+PRE_QUESTION_LABELS = build_question_short_labels(PRE_ASSESSMENT_KEY)
+POST_QUESTION_LABELS = build_question_short_labels(POST_ASSESSMENT_KEY)
 
 
 def normalize_string(s):
@@ -566,14 +1209,34 @@ def filter_out_unicode_responses(df):
     if df is None or df.empty:
         return df
     filtered = df.copy()
-    keep_mask = pd.Series(True, index=filtered.index)
-    for idx, col in enumerate(list(filtered.columns)):
+
+    replacements = {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2026": "...",
+        "\u00a0": " ",
+    }
+
+    def normalize_cell(value):
+        if pd.isna(value) or not isinstance(value, str):
+            return value
+        normalized = value
+        for old, new in replacements.items():
+            normalized = normalized.replace(old, new)
+        normalized = normalized.encode("ascii", "ignore").decode("ascii")
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
+
+    for idx in range(filtered.shape[1]):
         series = filtered.iloc[:, idx]
         if series.dtype == object:
-            keep_mask &= series.apply(
-                lambda x: pd.isna(x) or all(ord(c) < 128 for c in str(x))
-            )
-    return filtered.loc[keep_mask].copy()
+            filtered.iloc[:, idx] = series.apply(normalize_cell)
+
+    return filtered
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -689,7 +1352,18 @@ def generate_graded_dataframe(df, dynamic_answer_key):
 
 
 def normalize_phone(value):
-    digits = re.sub(r"\D", "", str(value or ""))
+    if pd.isna(value):
+        return ""
+
+    if isinstance(value, (int, np.integer)):
+        digits = str(int(value))
+    elif isinstance(value, (float, np.floating)):
+        digits = str(int(value)) if float(value).is_integer() else re.sub(r"\D", "", format(value, "f"))
+    else:
+        raw = str(value or "").strip()
+        raw = re.sub(r"\.0+$", "", raw)
+        digits = re.sub(r"\D", "", raw)
+
     if len(digits) > 10:
         digits = digits[-10:]
     return digits
@@ -756,7 +1430,152 @@ Generate a highly skimmable professional report using these exact markdown heade
 
 def create_insights_pdf(report_text):
     if FPDF is None:
-        return None
+        replacements = {
+            "\u2018": "'",
+            "\u2019": "'",
+            "\u201c": '"',
+            "\u201d": '"',
+            "\u2013": "-",
+            "\u2014": "-",
+            "\u2022": "-",
+            "\t": " ",
+        }
+        clean_text = report_text
+        for old, new in replacements.items():
+            clean_text = clean_text.replace(old, new)
+
+        sections = []
+        current_title = ""
+        current_items = []
+        current_paragraphs = []
+
+        def flush_section():
+            if current_title or current_items or current_paragraphs:
+                items_html = "".join(f"<li>{html.escape(item)}</li>" for item in current_items)
+                paragraphs_html = "".join(f"<p>{html.escape(p)}</p>" for p in current_paragraphs)
+                sections.append(
+                    f"""
+                    <section class="report-section">
+                        {f'<h2>{html.escape(current_title)}</h2>' if current_title else ''}
+                        {paragraphs_html}
+                        {f'<ul>{items_html}</ul>' if items_html else ''}
+                    </section>
+                    """
+                )
+
+        for raw_line in clean_text.splitlines():
+            line = re.sub(r"\s+", " ", raw_line).strip()
+            if not line:
+                continue
+            if line.startswith("### "):
+                flush_section()
+                current_title = line.replace("### ", "", 1).strip()
+                current_items = []
+                current_paragraphs = []
+            elif line.startswith("- "):
+                current_items.append(line[2:].strip())
+            else:
+                current_paragraphs.append(line)
+        flush_section()
+
+        body_html = "".join(sections) or "<p>Comparison report</p>"
+        pdf_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <style>
+                body {{
+                    font-family: Helvetica, Arial, sans-serif;
+                    color: #172033;
+                    margin: 0;
+                    padding: 38px 44px;
+                    background: #ffffff;
+                }}
+                .report-shell {{
+                    border: 1px solid #dbe3f0;
+                    border-radius: 16px;
+                    padding: 28px 30px;
+                    background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+                }}
+                .eyebrow {{
+                    font-size: 11px;
+                    letter-spacing: 0.24em;
+                    text-transform: uppercase;
+                    color: #6b7a90;
+                    margin-bottom: 8px;
+                    font-weight: 700;
+                }}
+                h1 {{
+                    margin: 0 0 10px 0;
+                    font-size: 28px;
+                    line-height: 1.15;
+                    color: #0f172a;
+                }}
+                .summary {{
+                    color: #516176;
+                    font-size: 13px;
+                    line-height: 1.6;
+                    margin-bottom: 22px;
+                }}
+                .report-section {{
+                    margin-top: 20px;
+                    padding-top: 16px;
+                    border-top: 1px solid #e2e8f0;
+                }}
+                .report-section:first-of-type {{
+                    border-top: none;
+                    margin-top: 0;
+                    padding-top: 0;
+                }}
+                h2 {{
+                    margin: 0 0 10px 0;
+                    font-size: 17px;
+                    color: #1d4ed8;
+                }}
+                p {{
+                    margin: 0 0 10px 0;
+                    font-size: 12px;
+                    line-height: 1.7;
+                }}
+                ul {{
+                    margin: 10px 0 0 18px;
+                    padding: 0;
+                }}
+                li {{
+                    margin: 0 0 7px 0;
+                    font-size: 12px;
+                    line-height: 1.55;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="report-shell">
+                <div class="eyebrow">EDXSO Insights Report</div>
+                <h1>Teacher Mental Health Training - Insights Report</h1>
+                <div class="summary">This report summarizes the participant's pre/post comparison in a clean printable format.</div>
+                {body_html}
+            </div>
+        </body>
+        </html>
+        """
+
+        ensure_playwright_ready()
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--single-process"],
+            )
+            page = browser.new_page()
+            page.set_content(pdf_html, wait_until="load")
+            page.wait_for_timeout(300)
+            pdf_bytes = page.pdf(
+                format="A4",
+                print_background=True,
+                margin={"top": "18px", "right": "18px", "bottom": "18px", "left": "18px"},
+            )
+            browser.close()
+        return pdf_bytes
     pdf = FPDF()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -784,11 +1603,842 @@ def create_insights_pdf(report_text):
     return bytes(pdf.output())
 
 
-def render_comparison_report():
-    st.title("Pre/Post Comparison Report")
-    st.markdown("Compare pre and post survey responses for each individual, matched by phone number.")
+def generate_comparison_pdf_playwright(record):
+    record_pre = record["pre_row"]
+    record_post = record["post_row"]
+    participant_name = record["name"]
+    participant_phone = record["phone"]
+    pre_score = int(record_pre["Total_Score"])
+    post_score = int(record_post["Total_Score"])
+    delta = post_score - pre_score
 
+    question_rows = []
+    for i in range(1, 13):
+        question_rows.append(
+            {
+                "Question": f"Q{i}",
+                "Pre": int(record_pre[f"Q{i}"]),
+                "Post": int(record_post[f"Q{i}"]),
+                "PreLabel": PRE_QUESTION_LABELS[i - 1]["text"],
+                "PostLabel": POST_QUESTION_LABELS[i - 1]["text"],
+            }
+        )
+    comparison_df = pd.DataFrame(question_rows)
+    comparison_long = comparison_df.melt(
+        id_vars="Question",
+        value_vars=["Pre", "Post"],
+        var_name="Survey",
+        value_name="Correct",
+    )
+
+    fig_compare = px.bar(
+        comparison_long,
+        x="Question",
+        y="Correct",
+        color="Survey",
+        barmode="group",
+        color_discrete_map={"Pre": "#2563eb", "Post": "#059669"},
+        title="Question-by-Question Comparison",
+    )
+    fig_compare.update_layout(
+        height=250,
+        margin=dict(l=10, r=10, t=42, b=8),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="DM Sans", color="#334155", size=9),
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1),
+    )
+    fig_compare.update_yaxes(range=[0, 1], tickvals=[0, 1], ticktext=["Incorrect", "Correct"])
+    compare_chart_html = fig_to_html(fig_compare, 820, 240)
+    plotly_js = get_plotlyjs()
+
+    improved_count = 0
+    declined_count = 0
+    unchanged_count = 0
+    detail_rows = ""
+    for row in question_rows:
+        change = row["Post"] - row["Pre"]
+        if change > 0:
+            movement_label = "Improved"
+            movement_class = "up"
+            improved_count += 1
+        elif change < 0:
+            movement_label = "Dropped"
+            movement_class = "down"
+            declined_count += 1
+        else:
+            movement_label = "Unchanged"
+            movement_class = "flat"
+            unchanged_count += 1
+
+        pre_badge = "Correct" if row["Pre"] else "Incorrect"
+        post_badge = "Correct" if row["Post"] else "Incorrect"
+        detail_rows += f"""
+        <tr>
+            <td class="q-col">{row['Question']}</td>
+            <td class="movement-col"><span class="movement-pill {movement_class}">{movement_label}</span></td>
+            <td class="text-col">
+                <div class="question-label">Pre Survey</div>
+                <div class="question-copy">{html.escape(row['PreLabel'])}</div>
+                <div class="status-wrap"><span class="detail-status {'ok' if row['Pre'] else 'miss'}">{pre_badge}</span></div>
+            </td>
+            <td class="text-col">
+                <div class="question-label">Post Survey</div>
+                <div class="question-copy">{html.escape(row['PostLabel'])}</div>
+                <div class="status-wrap"><span class="detail-status {'ok' if row['Post'] else 'miss'}">{post_badge}</span></div>
+            </td>
+        </tr>
+        """
+
+    delta_label = "Improved overall" if delta > 0 else "No score change" if delta == 0 else "Needs reinforcement"
+    delta_class = "delta-up" if delta > 0 else "delta-flat" if delta == 0 else "delta-down"
+    score_fill = max(0, min(post_score / 12, 1)) * 100
+    logo_uri = get_edxso_logo_data_uri()
+    logo_html = f'<img class="logo-mark" src="{logo_uri}" alt="EDXSO logo">' if logo_uri else ""
+
+    html_doc = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <script type="text/javascript">{plotly_js}</script>
+        <style>
+            * {{ box-sizing: border-box; }}
+            body {{
+                font-family: 'DM Sans', Helvetica, Arial, sans-serif;
+                color: #172033;
+                margin: 0;
+                padding: 10px 12px;
+                background: #ffffff;
+            }}
+            .shell {{
+                border: 1px solid #d7e2f3;
+                border-radius: 16px;
+                padding: 14px 16px 16px;
+                background: #ffffff;
+            }}
+            .eyebrow {{
+                font-size: 9px;
+                letter-spacing: 0.20em;
+                text-transform: uppercase;
+                color: #64748b;
+                font-weight: 700;
+                margin-bottom: 6px;
+            }}
+            .hero {{
+                display: grid;
+                grid-template-columns: 1.35fr 0.85fr;
+                gap: 10px;
+                align-items: stretch;
+                margin-bottom: 10px;
+                break-inside: avoid;
+                page-break-inside: avoid;
+            }}
+            .hero-copy {{
+                background: linear-gradient(135deg, #0f172a 0%, #1d4ed8 70%, #3b82f6 100%);
+                color: #ffffff;
+                border-radius: 14px;
+                padding: 12px 14px;
+            }}
+            .brand-row {{
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                margin-bottom: 8px;
+            }}
+            .logo-mark {{
+                width: 32px;
+                height: 32px;
+                object-fit: contain;
+                border-radius: 8px;
+                background: rgba(255,255,255,0.12);
+                padding: 3px;
+            }}
+            .brand-title {{
+                font-size: 10px;
+                letter-spacing: 0.12em;
+                text-transform: uppercase;
+                color: rgba(255,255,255,0.82);
+                font-weight: 700;
+            }}
+            .brand-sub {{
+                font-size: 9px;
+                color: rgba(255,255,255,0.72);
+            }}
+            h1 {{
+                margin: 0 0 5px 0;
+                font-size: 24px;
+                line-height: 1.08;
+                color: #ffffff;
+            }}
+            .sub {{
+                margin: 0 0 8px 0;
+                color: rgba(255,255,255,0.82);
+                font-size: 10px;
+                line-height: 1.4;
+            }}
+            .identity-row {{
+                display: flex;
+                gap: 6px;
+                flex-wrap: wrap;
+            }}
+            .identity-pill {{
+                border: 1px solid rgba(255,255,255,0.18);
+                background: rgba(255,255,255,0.08);
+                border-radius: 999px;
+                padding: 4px 8px;
+                font-size: 9px;
+                color: #ffffff;
+            }}
+            .hero-side {{
+                border: 1px solid #dbe3f0;
+                border-radius: 14px;
+                padding: 10px;
+                background: #f8fbff;
+            }}
+            .hero-side-label {{
+                font-size: 9px;
+                letter-spacing: 0.16em;
+                text-transform: uppercase;
+                color: #64748b;
+                font-weight: 700;
+                margin-bottom: 6px;
+            }}
+            .delta-number {{
+                font-size: 30px;
+                font-weight: 900;
+                line-height: 1;
+                color: #0f172a;
+                margin-bottom: 3px;
+            }}
+            .delta-pill {{
+                display: inline-block;
+                border-radius: 999px;
+                padding: 4px 8px;
+                font-size: 8px;
+                font-weight: 800;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+                margin-bottom: 6px;
+            }}
+            .delta-up {{ background: #dcfce7; color: #166534; }}
+            .delta-flat {{ background: #e2e8f0; color: #334155; }}
+            .delta-down {{ background: #fee2e2; color: #991b1b; }}
+            .score-line {{
+                display: flex;
+                justify-content: space-between;
+                font-size: 9px;
+                color: #475569;
+                margin-bottom: 5px;
+            }}
+            .score-track {{
+                height: 7px;
+                border-radius: 999px;
+                background: #dbeafe;
+                overflow: hidden;
+                margin-bottom: 5px;
+            }}
+            .score-fill {{
+                height: 100%;
+                width: {score_fill:.1f}%;
+                background: linear-gradient(90deg, #2563eb 0%, #059669 100%);
+            }}
+            .card-grid {{
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 7px;
+                margin-bottom: 10px;
+                break-inside: avoid;
+                page-break-inside: avoid;
+            }}
+            .card {{
+                border: 1px solid #e2e8f0;
+                border-radius: 10px;
+                padding: 8px;
+                background: #ffffff;
+            }}
+            .card-label {{
+                font-size: 8px;
+                letter-spacing: 0.18em;
+                text-transform: uppercase;
+                color: #64748b;
+                margin-bottom: 4px;
+                font-weight: 700;
+            }}
+            .card-value {{
+                font-size: 20px;
+                font-weight: 800;
+                color: #0f172a;
+                line-height: 1.05;
+            }}
+            .card-note {{
+                margin-top: 4px;
+                color: #64748b;
+                font-size: 8px;
+                line-height: 1.3;
+            }}
+            .section {{
+                margin-top: 10px;
+                padding-top: 7px;
+                border-top: 1px solid #e2e8f0;
+            }}
+            .section h2 {{
+                margin: 0 0 6px 0;
+                font-size: 14px;
+                color: #0f172a;
+            }}
+            .section-intro {{
+                color: #475569;
+                font-size: 9px;
+                line-height: 1.35;
+                margin-bottom: 6px;
+            }}
+            .movement-grid {{
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 7px;
+                break-inside: avoid;
+                page-break-inside: avoid;
+            }}
+            .movement-card {{
+                border: 1px solid #e2e8f0;
+                border-radius: 10px;
+                padding: 8px;
+                background: #ffffff;
+            }}
+            .movement-number {{
+                font-size: 20px;
+                font-weight: 900;
+                color: #0f172a;
+                line-height: 1;
+                margin-bottom: 2px;
+            }}
+            .movement-label {{
+                font-size: 8px;
+                letter-spacing: 0.16em;
+                text-transform: uppercase;
+                color: #64748b;
+                font-weight: 700;
+                margin-bottom: 4px;
+            }}
+            .movement-desc {{
+                font-size: 8px;
+                line-height: 1.3;
+                color: #475569;
+            }}
+            .detail-table {{
+                width: 100%;
+                border-collapse: separate;
+                border-spacing: 0;
+                table-layout: fixed;
+                border: 1px solid #dbe3f0;
+                border-radius: 10px;
+                overflow: hidden;
+            }}
+            .detail-table thead th {{
+                background: #f8fbff;
+                color: #64748b;
+                font-size: 8px;
+                letter-spacing: 0.18em;
+                text-transform: uppercase;
+                font-weight: 800;
+                padding: 6px 7px;
+                border-bottom: 1px solid #dbe3f0;
+                text-align: left;
+            }}
+            .detail-table tbody tr {{
+                break-inside: avoid;
+                page-break-inside: avoid;
+            }}
+            .detail-table tbody td {{
+                border-bottom: 1px solid #e2e8f0;
+                vertical-align: top;
+                padding: 7px;
+                background: #ffffff;
+            }}
+            .detail-table tbody tr:nth-child(even) td {{
+                background: #fbfdff;
+            }}
+            .detail-table tbody tr:last-child td {{
+                border-bottom: none;
+            }}
+            .q-col {{
+                width: 7%;
+                font-size: 11px;
+                font-weight: 800;
+                color: #0f172a;
+            }}
+            .movement-col {{
+                width: 15%;
+            }}
+            .text-col {{
+                width: 39%;
+            }}
+            .question-label {{
+                font-size: 7px;
+                letter-spacing: 0.14em;
+                text-transform: uppercase;
+                color: #64748b;
+                font-weight: 700;
+                margin-bottom: 3px;
+            }}
+            .question-copy {{
+                font-size: 8px;
+                color: #334155;
+                line-height: 1.25;
+                margin-bottom: 5px;
+            }}
+            .movement-pill {{
+                display: inline-block;
+                border-radius: 999px;
+                padding: 3px 7px;
+                font-size: 8px;
+                font-weight: 800;
+                letter-spacing: 0.06em;
+                text-transform: uppercase;
+            }}
+            .movement-pill.up {{ background: #dcfce7; color: #166534; }}
+            .movement-pill.flat {{ background: #e2e8f0; color: #334155; }}
+            .movement-pill.down {{ background: #fee2e2; color: #991b1b; }}
+            .detail-status {{
+                display: inline-block;
+                border-radius: 999px;
+                padding: 3px 7px;
+                font-size: 7px;
+                font-weight: 800;
+                letter-spacing: 0.04em;
+                text-transform: uppercase;
+            }}
+            .detail-status.ok {{ background: #dcfce7; color: #166534; }}
+            .detail-status.miss {{ background: #fee2e2; color: #991b1b; }}
+            @page {{ margin: 8px; }}
+            @media print {{
+                .hero, .card-grid, .movement-grid, .section, .detail-table, .detail-table tr, .detail-table td {{
+                    break-inside: avoid;
+                    page-break-inside: avoid;
+                }}
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="shell">
+            <div class="eyebrow">EDXSO Comparison Report</div>
+            <div class="hero">
+                <div class="hero-copy">
+                    <div class="brand-row">
+                        {logo_html}
+                        <div>
+                            <div class="brand-title">EDXSO Strategic Intelligence</div>
+                            <div class="brand-sub">Pre/Post participant comparison report</div>
+                        </div>
+                    </div>
+                    <h1>{html.escape(participant_name)}</h1>
+                    <p class="sub">A compact participant-level comparison showing score movement, question-level shifts, and areas that may need reinforcement.</p>
+                    <div class="identity-row">
+                        <div class="identity-pill">Phone {html.escape(participant_phone)}</div>
+                        <div class="identity-pill">Pre {pre_score}/12</div>
+                        <div class="identity-pill">Post {post_score}/12</div>
+                    </div>
+                </div>
+                <div class="hero-side">
+                    <div class="hero-side-label">Overall Movement</div>
+                    <div class="delta-number">{delta:+d}</div>
+                    <div class="delta-pill {delta_class}">{delta_label}</div>
+                    <div class="score-line">
+                        <span>Post score strength</span>
+                        <strong>{post_score}/12</strong>
+                    </div>
+                    <div class="score-track"><div class="score-fill"></div></div>
+                    <div class="card-note">Final post-assessment score as a share of the full 12-point scale.</div>
+                </div>
+            </div>
+
+            <div class="card-grid">
+                <div class="card">
+                    <div class="card-label">Phone</div>
+                    <div class="card-value">{html.escape(participant_phone)}</div>
+                    <div class="card-note">Matched across both uploaded survey files.</div>
+                </div>
+                <div class="card">
+                    <div class="card-label">Pre Score</div>
+                    <div class="card-value">{pre_score}/12</div>
+                    <div class="card-note">Correct responses before the session.</div>
+                </div>
+                <div class="card">
+                    <div class="card-label">Post Score</div>
+                    <div class="card-value">{post_score}/12</div>
+                    <div class="card-note">Correct responses after the session.</div>
+                </div>
+                <div class="card">
+                    <div class="card-label">Improvement</div>
+                    <div class="card-value">{delta:+d}</div>
+                    <div class="card-note">Net score movement for this participant.</div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>Performance Snapshot</h2>
+                <div class="section-intro">A quick summary of how the participant moved between the pre and post assessments.</div>
+                <div class="movement-grid">
+                    <div class="movement-card">
+                        <div class="movement-label">Improved Questions</div>
+                        <div class="movement-number">{improved_count}</div>
+                        <div class="movement-desc">Incorrect in pre, correct in post.</div>
+                    </div>
+                    <div class="movement-card">
+                        <div class="movement-label">Unchanged Questions</div>
+                        <div class="movement-number">{unchanged_count}</div>
+                        <div class="movement-desc">Stayed consistent across both surveys.</div>
+                    </div>
+                    <div class="movement-card">
+                        <div class="movement-label">Dropped Questions</div>
+                        <div class="movement-number">{declined_count}</div>
+                        <div class="movement-desc">Lower post result than pre.</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>Question Movement Chart</h2>
+                <div class="section-intro">Shared question indices are compared here as correct versus incorrect status across the two surveys.</div>
+                {compare_chart_html}
+            </div>
+
+            <div class="section">
+                <h2>Detailed Comparison Notes</h2>
+                <div class="section-intro">Each row compares the aligned pre and post prompts plus the participant's correct or incorrect status.</div>
+                <table class="detail-table">
+                    <thead>
+                        <tr>
+                            <th>Q</th>
+                            <th>Movement</th>
+                            <th>Pre Survey</th>
+                            <th>Post Survey</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {detail_rows}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+    ensure_playwright_ready()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--single-process"],
+        )
+        page = browser.new_page()
+        page.set_content(html_doc, wait_until="load")
+        page.wait_for_timeout(400)
+        pdf_bytes = page.pdf(
+            format="A4",
+            print_background=True,
+            margin={"top": "18px", "right": "18px", "bottom": "18px", "left": "18px"},
+        )
+        browser.close()
+    return pdf_bytes
+
+
+def generate_assessment_pdf_playwright(record, survey_title, question_metrics_df, participant_scores, base_answer_key):
+    total_score = int(record["Total_Score"])
+    total_questions = 12
+    percent_score = round((total_score / total_questions) * 100, 1)
+    clean_participants = len(participant_scores)
+    avg_score = round(sum(participant_scores) / clean_participants, 1) if clean_participants else 0
+    highest_score = max(participant_scores) if participant_scores else 0
+    survey_prefix = "Pre-Webinar" if "Pre" in survey_title else "Post-Webinar"
+    chart_title = f"{survey_prefix}: Accuracy per Question"
+    chart_subtitle = "Pre-Webinar Baseline" if "Pre" in survey_title else "Post-Webinar Results"
+
+    if percent_score >= 85:
+        label, badge_cls, desc = "High Readiness", "badge-benchmark", "Strong demonstrated understanding across the assessment."
+    elif percent_score >= 65:
+        label, badge_cls, desc = "Developing Readiness", "badge-strong", "Solid understanding with a few concepts still needing reinforcement."
+    elif percent_score >= 45:
+        label, badge_cls, desc = "Emerging Readiness", "badge-efficient", "Partial understanding is visible, but more support is still needed."
+    else:
+        label, badge_cls, desc = "Foundational Support Needed", "badge-fragile", "The participant may benefit from more targeted follow-up and revision."
+
+    question_rows = []
+    detail_rows = ""
+    for i in range(1, total_questions + 1):
+        prompt = record.get(f"QuestionText{i}", f"Question {i}")
+        accuracy_row = question_metrics_df.iloc[i - 1] if i - 1 < len(question_metrics_df) else None
+        accuracy_score = float(accuracy_row["Accuracy (%)"]) if accuracy_row is not None else 0.0
+        is_correct = bool(int(record[f"Q{i}"]))
+        status = "Correct" if is_correct else "Incorrect"
+        status_class = "ok" if is_correct else "miss"
+        correct_option = base_answer_key.get(prompt, "")
+        question_rows.append({"Question": f"Q{i}", "Accuracy (%)": accuracy_score})
+        detail_rows += f"""
+        <tr>
+            <td class="q-col">Q{i}</td>
+            <td>{html.escape(prompt)}</td>
+            <td class="status-col"><span class="status-pill {status_class}">{status}</span></td>
+            <td class="correct-option-col">{html.escape(correct_option) if not is_correct else "-"}</td>
+        </tr>
+        """
+
+    question_df = pd.DataFrame(question_rows)
+    fig_question = px.bar(
+        question_df,
+        x="Question",
+        y="Accuracy (%)",
+        title="",
+    )
+    fig_question.update_layout(
+        height=360,
+        margin=dict(l=96, r=24, t=12, b=72),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="DM Sans", color="#334155", size=12),
+        showlegend=False,
+        bargap=0.18,
+    )
+    fig_question.update_traces(
+        marker_color="#4e79a7",
+        marker_line_color="#1f2937",
+        marker_line_width=1,
+        hovertemplate="Question %{x}<br>Correct responses: %{y:.1f}%<extra></extra>",
+    )
+    fig_question.update_yaxes(
+        range=[0, 100],
+        title="Accuracy (%)",
+        title_standoff=18,
+        tickfont=dict(size=12),
+        tickvals=[0, 20, 40, 60, 80, 100],
+        showticklabels=True,
+        automargin=True,
+        gridcolor="rgba(148,163,184,0.18)",
+        zeroline=False,
+    )
+    fig_question.update_xaxes(
+        title="Questions",
+        title_standoff=14,
+        tickfont=dict(size=12),
+        tickmode="array",
+        tickvals=question_df["Question"].tolist(),
+        ticktext=question_df["Question"].tolist(),
+        showticklabels=True,
+        automargin=True,
+    )
+    question_chart_html = fig_to_html(fig_question, 1100, 360)
+    plotly_js = get_plotlyjs()
+
+    pdf_css = CUSTOM_CSS.replace(
+        "@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');",
+        "",
+    )
+    logo_uri = get_edxso_logo_data_uri()
+    logo_html = f'<img class="brand-logo" src="{logo_uri}" alt="EDXSO logo">' if logo_uri else ""
+
+    score_explainer = f"""
+    <div class="explain-wrap">
+        <div class="explain-head">Participant Overview</div>
+        <div class="explain-sub">{html.escape(survey_title)}</div>
+        <div class="explain-grid">
+            <div class="explain-card exp-rel">
+                <h4>Clean Data Participants</h4>
+                <ul>
+                    <li>{clean_participants} usable participant records included.</li>
+                    <li>The uploaded survey is summarized cohort-wide for benchmarking.</li>
+                    <li>This participant scored {total_score}/{total_questions}.</li>
+                </ul>
+            </div>
+            <div class="explain-card exp-reli">
+                <h4>Average Score</h4>
+                <ul>
+                    <li>Cohort average: {avg_score:.1f} / {total_questions}.</li>
+                    <li>Use this as the baseline for comparing individual performance.</li>
+                    <li>Higher averages indicate stronger overall readiness.</li>
+                </ul>
+            </div>
+            <div class="explain-card exp-repu">
+                <h4>Highest Score</h4>
+                <ul>
+                    <li>Top cohort score: {highest_score} / {total_questions}.</li>
+                    <li>Shows the current best observed outcome in the uploaded file.</li>
+                    <li>Useful for understanding score spread and ceiling performance.</li>
+                </ul>
+            </div>
+            <div class="explain-card exp-repu">
+                <h4>Interpretation</h4>
+                <ul>
+                    <li>{html.escape(desc)}</li>
+                    <li>Use the accuracy chart below to identify stronger and weaker question areas.</li>
+                    <li>The table below restores per-question correctness and adds the correct option detail wherever the answer was incorrect.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+    """
+
+    pdf_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <script type="text/javascript">{plotly_js}</script>
+        <style>
+            {pdf_css}
+            html, body {{ margin: 0 !important; padding: 0 !important; background: #ffffff; }}
+            .pdf-container {{ padding: 50px; width: 100%; box-sizing: border-box; }}
+            * {{ page-break-inside: avoid !important; page-break-before: auto !important; page-break-after: auto !important; }}
+            .brand-row {{ display:flex; align-items:center; gap:12px; margin-bottom: 14px; }}
+            .brand-logo {{
+                width: 52px;
+                height: 52px;
+                object-fit: contain;
+                border-radius: 12px;
+                background: #f8fbff;
+                border: 1px solid #dbe3f0;
+                padding: 6px;
+            }}
+            .brand-copy {{ display:flex; flex-direction:column; gap:3px; }}
+            .brand-name {{
+                font-family: 'DM Mono', monospace;
+                font-size: 0.68rem;
+                color: #64748b;
+                letter-spacing: 0.18em;
+                text-transform: uppercase;
+            }}
+            .brand-tagline {{
+                font-family: 'DM Sans', sans-serif;
+                font-size: 0.92rem;
+                color: #0f172a;
+                font-weight: 600;
+            }}
+            .hero-score {{
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                border-radius: 12px;
+                padding: 18px 20px;
+                margin-bottom: 24px;
+            }}
+            .hero-score .kpi-label {{ margin-bottom: 0.4rem; }}
+            .hero-score .kpi-value {{ font-size: 4.4rem; }}
+            .chart-section {{
+                margin-top: 26px;
+                margin-bottom: 28px;
+                border-top: 1px solid #e5e7eb;
+                padding-top: 22px;
+            }}
+            .chart-heading {{
+                font-family: 'DM Sans', sans-serif;
+                font-size: 18px;
+                font-weight: 800;
+                color: #1f2937;
+                margin-bottom: 8px;
+            }}
+            .chart-subheading {{
+                font-family: 'DM Sans', sans-serif;
+                font-size: 13px;
+                font-weight: 700;
+                color: #374151;
+                margin-bottom: 12px;
+            }}
+            .chart-col {{ display: block; border: none; border-radius: 0; padding: 0; overflow: visible; }}
+            .detail-table {{ width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed; border: 1px solid #dbe3f0; border-radius: 10px; overflow: hidden; }}
+            .detail-table thead th {{ background: #f8fbff; color: #64748b; font-size: 0.65rem; letter-spacing: 0.14em; text-transform: uppercase; font-weight: 800; text-align: left; padding: 10px 12px; border-bottom: 1px solid #dbe3f0; }}
+            .detail-table tbody td {{ padding: 10px 12px; border-bottom: 1px solid #e2e8f0; vertical-align: top; font-size: 0.82rem; line-height: 1.35; color:#334155; }}
+            .detail-table tbody tr:last-child td {{ border-bottom: none; }}
+            .q-col {{ width: 10%; font-weight: 800; color:#0f172a; }}
+            .status-col {{ width: 16%; }}
+            .correct-option-col {{ width: 26%; color:#475569; }}
+            .status-pill {{ display: inline-block; border-radius: 999px; padding: 4px 9px; font-size: 0.68rem; letter-spacing: 0.04em; text-transform: uppercase; font-weight: 800; }}
+            .status-pill.ok {{ background: #dcfce7; color: #166534; }}
+            .status-pill.miss {{ background: #fee2e2; color: #991b1b; }}
+        </style>
+    </head>
+    <body>
+        <div class="pdf-container">
+            <div class="brand-row">
+                {logo_html}
+                <div class="brand-copy">
+                    <div class="brand-name">EDXSO Strategic Intelligence</div>
+                    <div class="brand-tagline">Assessment Readiness Report</div>
+                </div>
+            </div>
+            <div class="sub-title" style="font-family: 'DM Mono', monospace; font-size: 0.75rem; color: #64748b; letter-spacing: 0.2em; text-transform: uppercase;">Your Strategic Report</div>
+            <h1 style="margin-top: 5px; margin-bottom: 15px;">{html.escape(record['Display_Name'])}</h1>
+
+            <div class="status-row" style="margin-bottom: 35px;">
+                <span class="status-badge {badge_cls}">{label}</span>
+                <span class="badge-desc">{html.escape(desc)}</span>
+            </div>
+
+            <div class="hero-score">
+                <div class="kpi-label">Assessment Score</div>
+                <div class="kpi-value growth">{total_score}/{total_questions}</div>
+            </div>
+
+            <div class="section-header">
+                <span class="section-number">01</span><span class="section-title">Assessment Highlights</span>
+            </div>
+            <div style="margin-top: 18px; margin-bottom: 28px;">{score_explainer}</div>
+
+            <div class="chart-section">
+                <div class="chart-heading">{chart_title}</div>
+                <div class="chart-subheading">{chart_subtitle}</div>
+                <div class="chart-col">
+                    {question_chart_html}
+                </div>
+            </div>
+
+            <div class="section-header">
+                <span class="section-number">02</span><span class="section-title">Question Accuracy Review</span>
+            </div>
+            <div style="margin-top: 18px;">
+                <table class="detail-table">
+                    <thead><tr><th>Q</th><th>Question</th><th>Status</th><th>Correct Option</th></tr></thead>
+                    <tbody>{detail_rows}</tbody>
+                </table>
+            </div>
+
+            <div style="margin-top: 50px; text-align: center; font-family: 'DM Mono', monospace; font-size: 10px; color: #94a3b8; text-transform: uppercase; border-top: 1px solid #e2e8f0; padding-top: 20px;">
+                R-Cube Strategic Intelligence · Edxso Analytics · Confidential Report
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+    ensure_playwright_ready()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--single-process"]
+        )
+        context = browser.new_context()
+        page = context.new_page()
+        page.set_content(pdf_html, wait_until="load")
+        page.wait_for_timeout(1200)
+        exact_height = page.evaluate("document.documentElement.scrollHeight")
+        adjusted_height = exact_height + 40
+        pdf_bytes = page.pdf(
+            width="1100px",
+            height=f"{adjusted_height}px",
+            print_background=True,
+            margin={"top": "0", "right": "0", "bottom": "0", "left": "0"}
+        )
+        browser.close()
+    return pdf_bytes
+
+
+def render_comparison_report():
     api_key = os.getenv("GEMINI_API_KEY")
+    load_attempted = st.session_state.get("comparison_load_attempted", False)
+    render_panel_header(
+        "Comparison Report",
+        "Pre/Post Individual Comparison",
+        "Upload the pre and post survey CSVs, match individuals by phone number, and generate a comparison report for one person at a time.",
+    )
+
     with st.sidebar:
         st.markdown("---")
         st.markdown("`Comparison Inputs`")
@@ -803,7 +2453,7 @@ def render_comparison_report():
             key="comparison_post_csv",
         )
         generate_comparison_report = st.button(
-            "Generate Comparison Report",
+            "Load Comparison Data",
             type="primary",
             use_container_width=True,
         )
@@ -814,13 +2464,42 @@ def render_comparison_report():
         st.caption(f"Post CSV: {'Uploaded' if post_file is not None else 'Waiting'}")
 
     if generate_comparison_report:
+        st.session_state["comparison_load_attempted"] = True
         st.session_state["comparison_process_clicked"] = True
 
-    if not st.session_state.get("comparison_process_clicked", False):
+    if not pre_file and not post_file:
+        st.session_state.current_library_key = None
+        st.session_state.generated_pdfs = {}
+        report_tab, pdf_tab, email_tab = st.tabs(["Report", "PDF Library", "Email Delivery"])
+        with report_tab:
+            render_info_card(
+                "How This Works",
+                "Upload both pre and post survey CSVs to unlock the individual comparison report view and generate new comparison PDFs.",
+            )
+        with pdf_tab:
+            render_info_card(
+                "Saved Reports",
+                "Previously generated comparison PDFs stay visible here even when no CSVs are uploaded. Upload the pre/post files only when you want to generate new comparison reports.",
+            )
+            library_panel = st.empty()
+            render_generated_pdf_library(library_panel, report_type="comparison")
+        with email_tab:
+            render_info_card(
+                "Email Delivery",
+                "You can bulk-send from any saved comparison survey library below, even without uploading new pre/post CSVs. Upload files only when you want to generate fresh comparison reports.",
+            )
+            render_saved_library_bulk_email_panel("comparison", "comparison_saved")
+        if load_attempted:
+            st.warning("Upload both pre and post survey CSV files, then click `Load Comparison Data` again.")
         return
 
-    if pre_file is None and post_file is None:
-        st.warning("Upload at least one CSV file for pre or post survey data.")
+    if not st.session_state.get("comparison_process_clicked", False):
+        render_info_card(
+            "How This Works",
+            "Use the sidebar to upload both CSV files. Once both are loaded, the app will match rows using the <b>phone</b> column and let you choose an individual comparison report.",
+        )
+        if pre_file is not None or post_file is not None:
+            st.info("Both files are ready to be processed. Click `Load Comparison Data` in the sidebar to build the comparison workspace.")
         return
 
     pre_df = post_df = None
@@ -858,101 +2537,453 @@ def render_comparison_report():
         st.warning("The uploaded post CSV has no usable rows after cleaning.")
         return
 
+    comparison_source_name = f"Comparison · {pre_file.name} vs {post_file.name}"
+    comparison_library_key = build_library_key(
+        f"{pre_file.name}__{post_file.name}",
+        pre_file.getvalue() + b"::" + post_file.getvalue(),
+    )
+    persist_library_meta(comparison_library_key, comparison_source_name, report_type="comparison")
+    if st.session_state.get("current_library_key") != comparison_library_key:
+        st.session_state.current_library_key = comparison_library_key
+        st.session_state.generated_pdfs = load_generated_pdf_library(comparison_library_key)
+        st.session_state.pdf_batch_log = []
+        st.session_state.email_batch_log = []
+        st.session_state.pdf_progress = {"current": 0, "total": 0, "message": "", "active": False}
+
     with st.spinner("Analyzing pre and post survey responses..."):
         dynamic_pre_key = build_dynamic_answer_mapping(pre_df, PRE_ASSESSMENT_KEY, api_key)
         dynamic_post_key = build_dynamic_answer_mapping(post_df, POST_ASSESSMENT_KEY, api_key)
         pre_graded_df = generate_individual_graded_dataframe(pre_df, dynamic_pre_key)
         post_graded_df = generate_individual_graded_dataframe(post_df, dynamic_post_key)
 
+    pre_phone_col = find_phone_column(pre_df)
+    post_phone_col = find_phone_column(post_df)
+    pre_phone_set = {
+        phone for phone in pre_graded_df["Phone"].tolist() if phone
+    }
+    post_phone_set = {
+        phone for phone in post_graded_df["Phone"].tolist() if phone
+    }
+
     matched_phones = sorted(
         {
             phone
             for phone in pre_graded_df["Phone"].tolist()
-            if phone and phone in set(post_graded_df["Phone"].tolist())
+            if phone and phone in post_phone_set
         }
     )
 
     if not matched_phones:
         st.error("No matching individuals were found between pre and post CSVs using phone number.")
+        debug_col1, debug_col2 = st.columns(2)
+        with debug_col1:
+            st.caption(f"Detected pre phone column: {pre_phone_col or 'Not found'}")
+            st.caption(f"Unique normalized pre phones: {len(pre_phone_set)}")
+            st.dataframe(
+                pd.DataFrame({"Pre phone sample": sorted(list(pre_phone_set))[:10]}),
+                width="stretch",
+                hide_index=True,
+            )
+        with debug_col2:
+            st.caption(f"Detected post phone column: {post_phone_col or 'Not found'}")
+            st.caption(f"Unique normalized post phones: {len(post_phone_set)}")
+            st.dataframe(
+                pd.DataFrame({"Post phone sample": sorted(list(post_phone_set))[:10]}),
+                width="stretch",
+                hide_index=True,
+            )
         return
 
-    participant_options = []
+    participant_records = []
     for phone in matched_phones:
         pre_row = pre_graded_df[pre_graded_df["Phone"] == phone].iloc[0]
-        name = pre_row["Name"] or "Participant"
-        participant_options.append(f"{name} ({phone})")
-
-    selected_participant = st.selectbox("Select Individual Comparison Report", participant_options)
-    selected_phone = re.search(r"\((\d+)\)$", selected_participant).group(1)
-    pre_row = pre_graded_df[pre_graded_df["Phone"] == selected_phone].iloc[0]
-    post_row = post_graded_df[post_graded_df["Phone"] == selected_phone].iloc[0]
-    participant_name = pre_row["Name"] or post_row["Name"] or "Participant"
-
-    st.header(participant_name)
-    stat1, stat2, stat3 = st.columns(3)
-    stat1.metric("Phone", selected_phone)
-    stat2.metric("Pre Score", f"{int(pre_row['Total_Score'])} / 12")
-    stat3.metric("Post Score", f"{int(post_row['Total_Score'])} / 12", delta=int(post_row["Total_Score"] - pre_row["Total_Score"]))
-
-    question_rows = []
-    for i in range(1, 13):
-        q_key = f"Q{i}"
-        question_rows.append(
+        post_row = post_graded_df[post_graded_df["Phone"] == phone].iloc[0]
+        participant_name = pre_row["Name"] or post_row["Name"] or "Participant"
+        contact = get_comparison_contact_details(pre_df, post_df, phone, participant_name)
+        participant_records.append(
             {
-                "Question": q_key,
-                "Pre": int(pre_row[q_key]),
-                "Post": int(post_row[q_key]),
+                "label": f"{participant_name} ({phone})",
+                "phone": phone,
+                "name": participant_name,
+                "contact": contact,
+                "pre_row": pre_row,
+                "post_row": post_row,
+                "user_id": f"{participant_name} ({phone})",
+                "file_name": build_comparison_pdf_filename(participant_name),
             }
         )
-    comparison_df = pd.DataFrame(question_rows)
-    comparison_long = comparison_df.melt(id_vars="Question", value_vars=["Pre", "Post"], var_name="Survey", value_name="Correct")
-    fig_compare = px.bar(
-        comparison_long,
-        x="Question",
-        y="Correct",
-        color="Survey",
-        barmode="group",
-        color_discrete_map={"Pre": "#1f77b4", "Post": "#2ca02c"},
-        title="Pre/Post Individual Question Comparison",
-    )
-    fig_compare.update_yaxes(range=[0, 1], tickvals=[0, 1], ticktext=["Incorrect", "Correct"])
-    st.plotly_chart(apply_grid(fig_compare), width="stretch")
 
-    detail_df = pd.DataFrame(
-        {
-            "Question": [f"Q{i}" for i in range(1, 13)],
-            "Pre": [int(pre_row[f"Q{i}"]) for i in range(1, 13)],
-            "Post": [int(post_row[f"Q{i}"]) for i in range(1, 13)],
-        }
-    )
-    st.subheader("Question Detail")
-    st.dataframe(detail_df, width="stretch")
+    email_ready_count = sum(1 for item in participant_records if item["contact"].get("email"))
 
-    insights_text = (
-        f"### Individual Comparison Summary\n"
-        f"- Participant: {participant_name}\n"
-        f"- Phone: {selected_phone}\n"
-        f"- Pre score: {int(pre_row['Total_Score'])}/12\n"
-        f"- Post score: {int(post_row['Total_Score'])}/12\n"
-        f"- Improvement: {int(post_row['Total_Score'] - pre_row['Total_Score'])}\n\n"
-        f"### Question-by-Question Shift\n"
-        + "\n".join(
-            f"- Q{i}: Pre {int(pre_row[f'Q{i}'])}, Post {int(post_row[f'Q{i}'])}"
-            for i in range(1, 13)
+    with st.sidebar:
+        st.markdown("---")
+        selected_participant = st.selectbox(
+            "Select User Report",
+            [item["label"] for item in participant_records],
+            help="The list shows only participants that exist in both uploaded CSVs after phone-number matching.",
         )
-    )
+        st.caption(f"Matched individuals: {len(participant_records)}")
+        st.caption(f"Email-ready rows: {email_ready_count}")
+        st.caption("Bulk email is available in the Email Delivery tab.")
 
-    st.subheader("Report Summary")
-    st.markdown(insights_text)
-    insights_pdf = create_insights_pdf(insights_text)
-    if insights_pdf:
-        st.download_button(
-            "Download Individual Comparison Report (PDF)",
-            insights_pdf,
-            f"{participant_name.replace(' ', '_')}_comparison_report.pdf",
-            "application/pdf",
-            use_container_width=True,
+    selected_record = next(item for item in participant_records if item["label"] == selected_participant)
+    selected_phone = selected_record["phone"]
+    participant_name = selected_record["name"]
+    pre_row = selected_record["pre_row"]
+    post_row = selected_record["post_row"]
+    contact = selected_record["contact"]
+    comparison_user_id = selected_record["user_id"]
+    comparison_file_name = selected_record["file_name"]
+
+    top_metric_1, top_metric_2, top_metric_3, top_metric_4 = st.columns(4)
+    with top_metric_1:
+        render_small_metric("Selected User", participant_name)
+    with top_metric_2:
+        render_small_metric("Matched Individuals", len(matched_phones))
+    with top_metric_3:
+        render_small_metric("Pre CSV Usable Rows", len(pre_df))
+    with top_metric_4:
+        render_small_metric("Post CSV Usable Rows", len(post_df))
+
+    def build_comparison_payload(record):
+        record_pre = record["pre_row"]
+        record_post = record["post_row"]
+        question_rows = []
+        for i in range(1, 13):
+            q_key = f"Q{i}"
+            question_rows.append(
+                {
+                    "Question": q_key,
+                    "Pre": int(record_pre[q_key]),
+                    "Post": int(record_post[q_key]),
+                }
+            )
+        comparison_df = pd.DataFrame(question_rows)
+        comparison_long = comparison_df.melt(
+            id_vars="Question",
+            value_vars=["Pre", "Post"],
+            var_name="Survey",
+            value_name="Correct",
         )
+        insights_text = (
+            f"### Individual Comparison Summary\n"
+            f"- Participant: {record['name']}\n"
+            f"- Phone: {record['phone']}\n"
+            f"- Pre score: {int(record_pre['Total_Score'])}/12\n"
+            f"- Post score: {int(record_post['Total_Score'])}/12\n"
+            f"- Improvement: {int(record_post['Total_Score'] - record_pre['Total_Score'])}\n\n"
+            f"### Question-by-Question Shift\n"
+            + "\n".join(
+                f"- Q{i}: Pre {int(record_pre[f'Q{i}'])}, Post {int(record_post[f'Q{i}'])}"
+                for i in range(1, 13)
+            )
+        )
+        return comparison_df, comparison_long, insights_text
+
+    selected_comparison_df, selected_comparison_long, insights_text = build_comparison_payload(selected_record)
+    insights_pdf = generate_comparison_pdf_playwright(selected_record)
+    comparison_existing_pdf = st.session_state.generated_pdfs.get(comparison_user_id)
+
+    report_tab, pdf_tab, email_tab = st.tabs(["Report", "PDF Library", "Email Delivery"])
+
+    with report_tab:
+        action_col, helper_col = st.columns([1.2, 1])
+        with action_col:
+            generate_single_comparison_pdf = False
+            if comparison_existing_pdf and Path(comparison_existing_pdf["file_path"]).exists():
+                st.download_button(
+                    "Download Compiled PDF",
+                    Path(comparison_existing_pdf["file_path"]).read_bytes(),
+                    comparison_existing_pdf["file_name"],
+                    "application/pdf",
+                    use_container_width=True,
+                    key="comparison_download_compiled_pdf",
+                )
+            else:
+                generate_single_comparison_pdf = st.button(
+                    "Compile Selected PDF",
+                    type="primary",
+                    use_container_width=True,
+                    key="comparison_compile_selected_pdf",
+                )
+        with helper_col:
+            render_info_card(
+                "Current Selection",
+                f"Previewing <b>{participant_name}</b>. Generate a comparison PDF here, then find it in the library just like the single report flow.",
+            )
+
+        st.markdown(section_header("01", participant_name), unsafe_allow_html=True)
+        stat1, stat2, stat3 = st.columns(3)
+        stat1.metric("Phone", selected_phone)
+        stat2.metric("Pre Score", f"{int(pre_row['Total_Score'])} / 12")
+        stat3.metric("Post Score", f"{int(post_row['Total_Score'])} / 12", delta=int(post_row["Total_Score"] - pre_row["Total_Score"]))
+        fig_compare = px.bar(
+            selected_comparison_long,
+            x="Question",
+            y="Correct",
+            color="Survey",
+            barmode="group",
+            color_discrete_map={"Pre": "#1f77b4", "Post": "#2ca02c"},
+            title="Pre/Post Individual Question Comparison",
+        )
+        fig_compare.update_yaxes(range=[0, 1], tickvals=[0, 1], ticktext=["Incorrect", "Correct"])
+        st.plotly_chart(apply_grid(fig_compare), use_container_width=True)
+
+        detail_df = pd.DataFrame(
+            {
+                "Question": [f"Q{i}" for i in range(1, 13)],
+                "Pre": [int(pre_row[f"Q{i}"]) for i in range(1, 13)],
+                "Post": [int(post_row[f"Q{i}"]) for i in range(1, 13)],
+            }
+        )
+        st.subheader("Question Detail")
+        st.dataframe(detail_df, use_container_width=True)
+
+        st.subheader("Report Summary")
+        st.markdown(insights_text)
+        if generate_single_comparison_pdf:
+            with st.spinner("Building comparison PDF..."):
+                if not insights_pdf:
+                    st.error("Comparison PDF could not be generated.")
+                else:
+                    try:
+                        st.session_state.pdf_progress = {
+                            "current": 1,
+                            "total": 1,
+                            "message": f"Generating selected PDF: {participant_name}",
+                            "active": True,
+                        }
+                        st.session_state.generated_pdfs[comparison_user_id] = save_generated_pdf_record(
+                            comparison_user_id,
+                            comparison_file_name,
+                            insights_pdf,
+                            comparison_library_key,
+                            email=contact["email"],
+                            name=contact["name"],
+                        )
+                        persist_generated_pdf_library(
+                            st.session_state.generated_pdfs,
+                            comparison_library_key,
+                        )
+                        st.session_state.pdf_progress = {
+                            "current": 1,
+                            "total": 1,
+                            "message": f"Generated selected PDF: {participant_name}",
+                            "active": False,
+                        }
+                        st.success("Comparison PDF rendered successfully!")
+                        st.rerun()
+                    except Exception as e:
+                        st.session_state.pdf_progress = {
+                            "current": 0,
+                            "total": 1,
+                            "message": f"Selected PDF failed: {e}",
+                            "active": False,
+                        }
+                        st.error(f"Could not save comparison PDF: {e}")
+
+        if insights_pdf:
+            st.download_button(
+                "Download Report",
+                insights_pdf,
+                comparison_file_name,
+                "application/pdf",
+                use_container_width=True,
+                key="comparison_download_selected_pdf",
+            )
+
+    with pdf_tab:
+        pdf_progress_panel = st.empty()
+        pdf_status_panel = st.empty()
+        pdf_log_panel = st.empty()
+        generated_list_panel = st.empty()
+        st.markdown(section_header("02", "PDF Library"), unsafe_allow_html=True)
+        action_left, action_mid, action_right = st.columns([1, 1, 1])
+        with action_left:
+            generate_all_comparison_pdfs = st.button(
+                "Generate PDFs For All Rows",
+                use_container_width=True,
+                key="comparison_generate_all_pdfs",
+            )
+        with action_mid:
+            clear_generated_pdfs = st.button(
+                "Clear Generated PDF List",
+                use_container_width=True,
+                key="comparison_clear_generated_pdfs",
+            )
+        with action_right:
+            render_info_card(
+                "Library Scope",
+                "This library is tied to the currently uploaded pre/post pair only. Running batch generation rebuilds the full set for this pair from scratch so the saved count always stays aligned.",
+            )
+
+        if st.session_state.pdf_progress["total"]:
+            progress_total = max(st.session_state.pdf_progress["total"], 1)
+            progress_current = min(st.session_state.pdf_progress["current"], progress_total)
+            pdf_progress_panel.progress(
+                progress_current / progress_total,
+                text=f"Generating PDFs: {progress_current}/{progress_total}",
+            )
+            if st.session_state.pdf_progress["message"]:
+                if st.session_state.pdf_progress["active"]:
+                    pdf_status_panel.info(st.session_state.pdf_progress["message"])
+                else:
+                    pdf_status_panel.success(st.session_state.pdf_progress["message"])
+
+        if generate_single_comparison_pdf and insights_pdf:
+            try:
+                st.session_state.generated_pdfs[comparison_user_id] = save_generated_pdf_record(
+                    comparison_user_id,
+                    comparison_file_name,
+                    insights_pdf,
+                    comparison_library_key,
+                    email=contact["email"],
+                    name=contact["name"],
+                )
+                persist_generated_pdf_library(
+                    st.session_state.generated_pdfs,
+                    comparison_library_key,
+                )
+                st.success("Comparison PDF saved to the library.")
+            except Exception as e:
+                st.error(f"Could not save comparison PDF: {e}")
+        if clear_generated_pdfs:
+            st.session_state.generated_pdfs = {}
+            st.session_state.pdf_batch_log = []
+            st.session_state.pdf_progress = {"current": 0, "total": 0, "message": "", "active": False}
+            clear_generated_pdf_library(comparison_library_key)
+            st.success("Cleared generated PDF list.")
+        if generate_all_comparison_pdfs:
+            total_reports = len(participant_records)
+            st.session_state.generated_pdfs = {}
+            clear_generated_pdf_library(comparison_library_key)
+            batch_log = []
+            generated_count = 0
+
+            for position, record in enumerate(participant_records, start=1):
+                current_name = record["name"]
+                st.session_state.pdf_progress = {
+                    "current": position,
+                    "total": total_reports,
+                    "message": f"Generating {position}/{total_reports}: {current_name}",
+                    "active": True,
+                }
+                pdf_progress_panel.progress(position / total_reports, text=f"Generating PDFs: {position}/{total_reports}")
+                pdf_status_panel.info(st.session_state.pdf_progress["message"])
+                try:
+                    record_pdf = generate_comparison_pdf_playwright(record)
+                    st.session_state.generated_pdfs[record["user_id"]] = save_generated_pdf_record(
+                        record["user_id"],
+                        record["file_name"],
+                        record_pdf,
+                        comparison_library_key,
+                        email=record["contact"]["email"],
+                        name=record["contact"]["name"],
+                    )
+                    persist_generated_pdf_library(
+                        st.session_state.generated_pdfs,
+                        comparison_library_key,
+                    )
+                    generated_count += 1
+                    batch_log.append(f"{position}/{total_reports} generated: {current_name}")
+                    render_generated_pdf_library(generated_list_panel, report_type="comparison")
+                except Exception as e:
+                    batch_log.append(f"{position}/{total_reports} failed: {current_name} ({e})")
+
+            st.session_state.pdf_batch_log = batch_log
+            st.session_state.pdf_progress = {
+                "current": total_reports,
+                "total": total_reports,
+                "message": f"Generated {generated_count}/{total_reports} PDF(s).",
+                "active": False,
+            }
+            pdf_progress_panel.progress(1.0, text=f"Generating PDFs: {total_reports}/{total_reports}")
+            pdf_status_panel.success(st.session_state.pdf_progress["message"])
+
+        if st.session_state.pdf_batch_log:
+            with pdf_log_panel.container():
+                for line in st.session_state.pdf_batch_log[-10:]:
+                    st.write(f"- {line}")
+        render_generated_pdf_library(generated_list_panel, report_type="comparison")
+
+    with email_tab:
+        email_progress_panel = st.empty()
+        email_status_panel = st.empty()
+        email_log_panel = st.empty()
+        st.markdown(section_header("03", "Email Delivery"), unsafe_allow_html=True)
+        email_action_col, email_help_col = st.columns([1, 1.1])
+        with email_action_col:
+            send_bulk_comparison_emails = st.button(
+                "Send Bulk Emails",
+                use_container_width=True,
+                key="comparison_send_bulk_emails",
+            )
+        with email_help_col:
+            render_info_card(
+                "Batch Sender",
+                "This tab sends comparison PDFs as email attachments for all matched individuals that have an email address in either uploaded CSV.",
+            )
+
+        metric_a, metric_b = st.columns(2)
+        with metric_a:
+            render_small_metric("Email-Ready Rows", email_ready_count)
+        with metric_b:
+            render_small_metric("Email Mode", "Bulk Send")
+
+        if send_bulk_comparison_emails:
+            with st.spinner("Generating comparison PDFs and sending emails..."):
+                try:
+                    from send_pending_reports import send_email_with_attachment
+
+                    total_targets = max(email_ready_count, 1)
+                    email_progress = email_progress_panel.progress(
+                        0,
+                        text=f"Sending emails: 0/{email_ready_count}",
+                    )
+                    run_log = []
+                    sent_count = 0
+                    failed_count = 0
+                    sendable_records = [item for item in participant_records if item["contact"].get("email")]
+
+                    for index, record in enumerate(sendable_records, start=1):
+                        email_status_panel.info(f"{index}/{email_ready_count}: Sending {record['name']}")
+                        email_progress.progress(index / total_targets, text=f"Sending emails: {index}/{email_ready_count}")
+                        try:
+                            record_pdf = generate_comparison_pdf_playwright(record)
+                            response = send_email_with_attachment(
+                                email=record["contact"]["email"],
+                                name=record["contact"]["name"],
+                                file_name=record["file_name"],
+                                file_bytes=record_pdf,
+                            )
+                            if response.status_code in (200, 201):
+                                sent_count += 1
+                                run_log.append(f"Sent: {record['name']} ({record['contact']['email']})")
+                            else:
+                                failed_count += 1
+                                run_log.append(
+                                    f"Failed: {record['name']} ({response.status_code})"
+                                )
+                        except Exception as e:
+                            failed_count += 1
+                            run_log.append(f"Failed: {record['name']} ({e})")
+
+                    st.session_state.email_batch_log = run_log
+                    if sent_count:
+                        st.success(f"Sent {sent_count} email(s).")
+                    if failed_count:
+                        st.error(f"{failed_count} email(s) failed.")
+                    email_status_panel.success(
+                        f"Completed email run: {sent_count} sent, {failed_count} failed."
+                    )
+                except Exception as e:
+                    st.error(f"Email sending failed: {e}")
+
+        if st.session_state.email_batch_log:
+            st.markdown("**Recent Email Activity**")
+            with email_log_panel.container():
+                for line in st.session_state.email_batch_log[-10:]:
+                    st.write(f"- {line}")
 
 # ─────────────────────────────────────────────
 #  CHART BUILDERS
@@ -1114,6 +3145,8 @@ def generate_user_pdf_playwright(row):
         "",
     )
     plotly_js = get_plotlyjs()
+    logo_uri = get_edxso_logo_data_uri()
+    logo_html = f'<img class="brand-logo" src="{logo_uri}" alt="EDXSO logo">' if logo_uri else ""
     
     # 2. Inject the HTML directly (No <img> tags needed!)
     pdf_html = f"""
@@ -1127,6 +3160,30 @@ def generate_user_pdf_playwright(row):
             html, body {{ margin: 0 !important; padding: 0 !important; background: #ffffff; }}
             .pdf-container {{ padding: 50px; width: 100%; box-sizing: border-box; }}
             * {{ page-break-inside: avoid !important; page-break-before: auto !important; page-break-after: auto !important; }}
+            .brand-row {{ display:flex; align-items:center; gap:12px; margin-bottom: 14px; }}
+            .brand-logo {{
+                width: 52px;
+                height: 52px;
+                object-fit: contain;
+                border-radius: 12px;
+                background: #f8fbff;
+                border: 1px solid #dbe3f0;
+                padding: 6px;
+            }}
+            .brand-copy {{ display:flex; flex-direction:column; gap:3px; }}
+            .brand-name {{
+                font-family: 'DM Mono', monospace;
+                font-size: 0.68rem;
+                color: #64748b;
+                letter-spacing: 0.18em;
+                text-transform: uppercase;
+            }}
+            .brand-tagline {{
+                font-family: 'DM Sans', sans-serif;
+                font-size: 0.92rem;
+                color: #0f172a;
+                font-weight: 600;
+            }}
             .kpi-row {{ display: flex; gap: 20px; margin-bottom: 25px; align-items: stretch; }}
             .kpi-col {{ flex: 1; display: flex; flex-direction: column; }}
             .chart-col {{ flex: 1.5; display: flex; justify-content: center; align-items: center; border: 1px solid #e2e8f0; border-radius: 12px; }}
@@ -1136,6 +3193,13 @@ def generate_user_pdf_playwright(row):
     </head>
     <body>
         <div class="pdf-container">
+            <div class="brand-row">
+                {logo_html}
+                <div class="brand-copy">
+                    <div class="brand-name">EDXSO Strategic Intelligence</div>
+                    <div class="brand-tagline">Growth and Readiness Report</div>
+                </div>
+            </div>
             <div class="sub-title" style="font-family: 'DM Mono', monospace; font-size: 0.75rem; color: #64748b; letter-spacing: 0.2em; text-transform: uppercase;">Your Strategic Report</div>
             <h1 style="margin-top: 5px; margin-bottom: 15px;">{row['Display_Name']}</h1>
             
@@ -1187,6 +3251,7 @@ def generate_user_pdf_playwright(row):
     </html>
     """
     
+    ensure_playwright_ready()
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -1212,9 +3277,204 @@ def generate_user_pdf_playwright(row):
         browser.close()
         return pdf_bytes
 
+
+def build_assessment_pdf_filename(name, survey_kind):
+    safe_name = "_".join(str(name or "Participant").split())
+    prefix = "PreAssessment" if survey_kind == "pre_assessment" else "PostAssessment"
+    return f"{prefix}_{safe_name}.pdf"
+
+
+def render_assessment_single_report(raw, uploaded_file, current_library_key, survey_kind):
+    api_key = os.getenv("GEMINI_API_KEY")
+    answer_key = PRE_ASSESSMENT_KEY if survey_kind == "pre_assessment" else POST_ASSESSMENT_KEY
+    survey_title = "Pre Assessment Survey" if survey_kind == "pre_assessment" else "Post Assessment Survey"
+
+    results, dynamic_answer_key = prepare_assessment_results(raw, answer_key, api_key)
+    question_metrics_df = get_question_metrics(raw, dynamic_answer_key, answer_key)
+    participant_scores = get_participant_scores(raw, dynamic_answer_key)
+    status_col = find_column_name(raw, ["status", "mail status", "email status"])
+    pending_count = raw[status_col].astype(str).str.strip().eq("Pending").sum() if status_col is not None else len(raw)
+
+    with st.sidebar:
+        st.markdown("---")
+        user_choice = st.selectbox("Select User Report", results["UserID"].tolist())
+        st.caption(f"Uploaded list rows: {len(results)}")
+        st.caption(f"Pending email rows: {pending_count}")
+        st.caption(f"Detected survey: {survey_title}")
+
+    row = results[results["UserID"] == user_choice].iloc[0].copy()
+    for i, question in enumerate(answer_key.keys(), start=1):
+        row[f"QuestionText{i}"] = question
+
+    total_questions = 12
+    score = int(row["Total_Score"])
+    percent_score = round((score / total_questions) * 100, 1)
+    single_existing_pdf = st.session_state.generated_pdfs.get(user_choice)
+    saved_pdf_count = len(st.session_state.generated_pdfs)
+
+    render_panel_header(
+        "Assessment Report",
+        survey_title,
+        "Review one participant at a time, generate PDFs in bulk, and send email attachments from the same workspace.",
+    )
+    top_a, top_b, top_c, top_d = st.columns(4)
+    with top_a:
+        render_small_metric("Participants", len(results))
+    with top_b:
+        assessment_progress_panel = st.empty()
+        render_progress_metric(assessment_progress_panel, saved_pdf_count, len(results))
+    with top_c:
+        render_small_metric("Pending Emails", pending_count)
+    with top_d:
+        render_small_metric("Survey Type", "Pre Assessment" if survey_kind == "pre_assessment" else "Post Assessment")
+
+    report_tab, pdf_tab, email_tab = st.tabs(["Report", "PDF Library", "Email Delivery"])
+
+    with report_tab:
+        action_col, helper_col = st.columns([1.2, 1])
+        report_status_panel = st.empty()
+        with action_col:
+            generate_single_pdf = False
+            if single_existing_pdf and Path(single_existing_pdf["file_path"]).exists():
+                download_col, recompile_col = st.columns(2)
+                with download_col:
+                    st.download_button(
+                        "Download Compiled PDF",
+                        Path(single_existing_pdf["file_path"]).read_bytes(),
+                        single_existing_pdf["file_name"],
+                        "application/pdf",
+                        use_container_width=True,
+                        key=f"assessment_download_compiled_{user_choice}",
+                    )
+                with recompile_col:
+                    generate_single_pdf = st.button(
+                        "Recompile PDF",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"assessment_recompile_{user_choice}",
+                    )
+            else:
+                generate_single_pdf = st.button(
+                    "Compile Selected PDF",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"assessment_compile_{user_choice}",
+                )
+        with helper_col:
+            render_info_card(
+                "Detected Survey",
+                f"This file was auto-identified as <b>{survey_title}</b>, so the app is using question headers and participant fields from column names instead of fixed positions.",
+            )
+            if single_existing_pdf and Path(single_existing_pdf["file_path"]).exists():
+                st.caption("A previously saved PDF already exists for this participant. Use `Recompile PDF` to refresh it with the latest report template and branding.")
+
+        st.markdown(section_header("01", row["Display_Name"]), unsafe_allow_html=True)
+        m1, m2 = st.columns(2)
+        m1.metric("Email", row.get("Email", "") or "-")
+        m2.metric("Score", f"{score}/{total_questions}", delta=f"{percent_score}%")
+
+        detail_df = pd.DataFrame(
+            {
+                "Question": [f"Q{i}" for i in range(1, total_questions + 1)],
+                "Status": ["Correct" if int(row[f"Q{i}"]) else "Incorrect" for i in range(1, total_questions + 1)],
+                "Prompt": list(answer_key.keys()),
+            }
+        )
+        st.dataframe(detail_df, use_container_width=True, hide_index=True)
+
+        if generate_single_pdf:
+            report_status_panel.info(f"Recompiling PDF for {row['Display_Name']}...")
+            with st.spinner("Rendering assessment PDF..."):
+                try:
+                    pdf_bytes = generate_assessment_pdf_playwright(
+                        row,
+                        survey_title,
+                        question_metrics_df,
+                        participant_scores,
+                        answer_key,
+                    )
+                    file_name = build_assessment_pdf_filename(user_choice, survey_kind)
+                    st.session_state.generated_pdfs[user_choice] = save_generated_pdf_record(
+                        user_choice,
+                        file_name,
+                        pdf_bytes,
+                        current_library_key,
+                        email=row.get("Email", ""),
+                        name=row.get("Display_Name", user_choice),
+                    )
+                    persist_generated_pdf_library(st.session_state.generated_pdfs, current_library_key)
+                    report_status_panel.success(f"Recompiled PDF for {row['Display_Name']}.")
+                    st.success("PDF rendered successfully!")
+                    st.rerun()
+                except Exception as e:
+                    report_status_panel.error(f"Recompile failed for {row['Display_Name']}: {e}")
+                    st.error(f"Render failed: {e}")
+
+    with pdf_tab:
+        st.markdown(section_header("02", "PDF Library"), unsafe_allow_html=True)
+        if st.button("Generate PDFs For All Rows", use_container_width=True, key="assessment_batch_pdf"):
+            st.session_state.generated_pdfs = {}
+            clear_generated_pdf_library(current_library_key)
+            render_progress_metric(assessment_progress_panel, 0, len(results))
+            batch_log = []
+            generated_count = 0
+            for position, (_, report_row) in enumerate(results.iterrows(), start=1):
+                current_name = resolve_record_display_name(report_row, fallback=f"User {position}")
+                try:
+                    record = report_row.copy()
+                    for i, question in enumerate(answer_key.keys(), start=1):
+                        record[f"QuestionText{i}"] = question
+                    pdf_bytes = generate_assessment_pdf_playwright(
+                        record,
+                        survey_title,
+                        question_metrics_df,
+                        participant_scores,
+                        answer_key,
+                    )
+                    st.session_state.generated_pdfs[report_row["UserID"]] = save_generated_pdf_record(
+                        report_row["UserID"],
+                        build_assessment_pdf_filename(current_name, survey_kind),
+                        pdf_bytes,
+                        current_library_key,
+                        email=report_row.get("Email", ""),
+                        name=current_name,
+                    )
+                    generated_count += 1
+                    render_progress_metric(assessment_progress_panel, generated_count, len(results))
+                    batch_log.append(f"{position}/{len(results)} generated: {current_name}")
+                except Exception as e:
+                    render_progress_metric(assessment_progress_panel, generated_count, len(results))
+                    batch_log.append(f"{position}/{len(results)} failed: {current_name} ({e})")
+            persist_generated_pdf_library(st.session_state.generated_pdfs, current_library_key)
+            st.session_state.pdf_batch_log = batch_log
+            st.success("Batch PDF generation finished.")
+        if st.button("Clear Generated PDF List", use_container_width=True, key="assessment_clear_pdf"):
+            st.session_state.generated_pdfs = {}
+            clear_generated_pdf_library(current_library_key)
+            st.success("Cleared generated PDF list.")
+        if st.session_state.pdf_batch_log:
+            for line in st.session_state.pdf_batch_log[-10:]:
+                st.write(f"- {line}")
+        library_panel = st.empty()
+        render_generated_pdf_library(library_panel, report_type="single")
+
+    with email_tab:
+        st.markdown(section_header("03", "Email Delivery"), unsafe_allow_html=True)
+        if st.button("Send Bulk Emails", use_container_width=True, key="assessment_bulk_email"):
+            with st.spinner("Generating PDFs and sending emails..."):
+                try:
+                    from send_pending_reports import send_pending_reports_from_dataframe
+                    run_log = send_pending_reports_from_dataframe(raw)
+                    st.session_state.email_batch_log = [item["message"] for item in run_log]
+                    st.success("Completed email run.")
+                except Exception as e:
+                    st.error(f"Email sending failed: {e}")
+        if st.session_state.email_batch_log:
+            for line in st.session_state.email_batch_log[-10:]:
+                st.write(f"- {line}")
+
 def run_app():
     install_playwright()
-    st.set_page_config(**APP_PAGE_CONFIG)
     st.markdown(f"<style>{CUSTOM_CSS}</style>", unsafe_allow_html=True)
     if "generated_pdfs" not in st.session_state:
         st.session_state.generated_pdfs = {}
@@ -1222,8 +3482,6 @@ def run_app():
         st.session_state.pdf_batch_log = []
     if "email_batch_log" not in st.session_state:
         st.session_state.email_batch_log = []
-    if "current_screen" not in st.session_state:
-        st.session_state.current_screen = "report"
     if "pdf_progress" not in st.session_state:
         st.session_state.pdf_progress = {"current": 0, "total": 0, "message": "", "active": False}
 
@@ -1239,9 +3497,10 @@ def run_app():
         </div>
         """, unsafe_allow_html=True)
 
-        report_mode = st.selectbox(
+        report_mode = st.radio(
             "Report Type",
             ["Single Report", "Pre/Post Comparison"],
+            horizontal=True,
         )
 
         if report_mode == "Single Report":
@@ -1254,23 +3513,37 @@ def run_app():
         return
 
     if not uploaded_file:
-        st.markdown("""
-        <div style='display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 70vh; text-align: center; padding: 2rem;'>
-            <div style='font-family: Playfair Display, serif; font-size: 3.5rem; font-weight: 900; color: #0f172a; line-height: 1.1; max-width: 700px;'>
-                R-Cube Strategic<br>Command Centre
-            </div>
-            <div style='font-family: DM Sans, sans-serif; font-size: 1.1rem; color: #475569; margin-top: 1rem; max-width: 480px; line-height: 1.7;'>
-                Upload your response CSV to generate per-user strategic profiles, maturity-adjusted R-scores, and stage diagnostics.
-            </div>
-            <div style='margin-top: 2.5rem; font-family: DM Mono, monospace; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.2em; text-transform: uppercase; color: #334155; border: 1px dashed #cbd5e1; background: #ffffff; padding: 0.75rem 1.5rem; border-radius: 8px;'>
-                ← Upload CSV in sidebar to begin
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+        st.session_state.current_library_key = None
+        st.session_state.generated_pdfs = {}
+        render_panel_header(
+            "Single Report",
+            "R-Cube Strategic Command Centre",
+            "Upload one survey CSV to review individual reports, generate a PDF library, and send emails from one place.",
+        )
+        report_tab, pdf_tab, email_tab = st.tabs(["Report", "PDF Library", "Email Delivery"])
+        with report_tab:
+            render_info_card(
+                "Get Started",
+                "Upload your survey CSV to unlock the individual report view and generate new PDFs for selected users.",
+            )
+        with pdf_tab:
+            render_info_card(
+                "Saved Reports",
+                "Previously generated PDFs stay visible here even when no survey is uploaded. Upload a CSV only when you want to generate new reports.",
+            )
+            library_panel = st.empty()
+            render_generated_pdf_library(library_panel, report_type="single")
+        with email_tab:
+            render_info_card(
+                "Email Delivery",
+                "You can bulk-send from any saved survey library below, even without uploading a new CSV. Upload a survey CSV only when you want to generate fresh reports first.",
+            )
+            render_saved_library_bulk_email_panel("single", "single_saved")
         return
 
     uploaded_file_bytes = uploaded_file.getvalue()
     current_library_key = build_library_key(uploaded_file.name, uploaded_file_bytes)
+    persist_library_meta(current_library_key, uploaded_file.name)
     if st.session_state.get("current_library_key") != current_library_key:
         st.session_state.current_library_key = current_library_key
         st.session_state.generated_pdfs = load_generated_pdf_library(current_library_key)
@@ -1278,6 +3551,12 @@ def run_app():
         st.session_state.pdf_progress = {"current": 0, "total": 0, "message": "", "active": False}
 
     raw = pd.read_csv(io.BytesIO(uploaded_file_bytes))
+    survey_kind = infer_single_survey_kind(raw)
+    if survey_kind in {"pre_assessment", "post_assessment"}:
+        render_assessment_single_report(raw, uploaded_file, current_library_key, survey_kind)
+        st.markdown("""<div style='margin-top: 1rem; padding-top: 1.5rem; border-top: 1px solid #e2e8f0; font-family: DM Mono, monospace; font-size: 0.6rem; color: #94a3b8; letter-spacing: 0.15em; text-transform: uppercase; text-align: center;'>R-Cube Screening Metric · EDXSO Strategic Intelligence · Screening Tool</div>""", unsafe_allow_html=True)
+        return
+
     results = prepare_results(raw)
     status_col = find_column_name(raw, ["status", "mail status", "email status"])
     pending_count = (
@@ -1288,69 +3567,70 @@ def run_app():
     with st.sidebar:
         st.markdown("---")
         user_choice = st.selectbox("Select User Report", results['UserID'].tolist())
-
-        st.markdown("`PDF Actions`")
-        generate_single_pdf = st.button(
-            "Compile Selected PDF",
-            type="primary",
-            use_container_width=True,
-        )
-        generate_all_pdfs = st.button("Generate PDFs For All Rows", use_container_width=True)
-        clear_generated_pdfs = st.button("Clear Generated PDF List", use_container_width=True)
-
-        st.markdown("`Email Actions`")
+        st.caption(f"Uploaded list rows: {len(results)}")
         st.caption(f"Pending email rows: {pending_count}")
-        send_pending_emails = st.button("Send Pending Emails", use_container_width=True)
-
-        st.markdown(f"""
-        <div style='font-family: DM Mono, monospace; font-size: 0.6rem; color: #64748b; letter-spacing: 0.1em; text-transform: uppercase; margin-top: 1rem;'>Cohort Size</div>
-        <div style='font-family: Playfair Display, serif; font-size: 2rem; font-weight: 900; color: #0f172a;'>{len(results)}</div>
-        """, unsafe_allow_html=True)
-
-        avg_gi = results['Growth_Index'].mean()
-        rank = int(results['Growth_Index'].rank(ascending=False)[results['UserID'] == user_choice].values[0])
-        st.markdown(f"""
-        <div style='margin-top: 1rem;'><div style='font-family: DM Mono, monospace; font-size: 0.6rem; color: #64748b; letter-spacing: 0.1em; text-transform: uppercase;'>Cohort Avg GI</div><div style='font-family: Playfair Display, serif; font-size: 1.6rem; font-weight: 900; color: #0f172a;'>{avg_gi:.1f}</div></div>
-        <div style='margin-top: 1rem;'><div style='font-family: DM Mono, monospace; font-size: 0.6rem; color: #64748b; letter-spacing: 0.1em; text-transform: uppercase;'>Current Rank</div><div style='font-family: Playfair Display, serif; font-size: 1.6rem; font-weight: 900; color: #059669;'>#{rank} / {len(results)}</div></div>
-        """, unsafe_allow_html=True)
-
-        st.markdown("---")
-        st.markdown("""
-        <div style='font-family: DM Mono, monospace; font-size: 0.6rem; color: #475569; letter-spacing: 0.1em; text-transform: uppercase;'>
-        Scoring Model
-        </div>
-        <div style='font-size: 0.78rem; color: #64748b; margin-top: 0.5rem; line-height: 1.6;'>
-        <b style='color:#d97706;'>Relevance</b> — Q1,2,5,11,13,14<br>
-        <b style='color:#2563eb;'>Reliability</b> — Q3,4,6-10,12,14,15<br>
-        <b style='color:#7c3aed;'>Reputability</b> — Q16–20<br><br>
-        <span style='background: #f1f5f9; padding: 2px 4px; border-radius:4px; color:#0f172a;'>GI = 0.35·R + 0.40·Rel + 0.25·Rep</span>
-        </div>
-        """, unsafe_allow_html=True)
+        st.caption("Bulk email is available in the Email Delivery tab.")
+        with st.expander("Scoring model"):
+            st.markdown("""
+            <div style='font-size: 0.82rem; color: #64748b; line-height: 1.7;'>
+            <b style='color:#d97706;'>Relevance</b> — Q1,2,5,11,13,14<br>
+            <b style='color:#2563eb;'>Reliability</b> — Q3,4,6-10,12,14,15<br>
+            <b style='color:#7c3aed;'>Reputability</b> — Q16–20<br><br>
+            <span style='background: #f1f5f9; padding: 2px 4px; border-radius:4px; color:#0f172a;'>GI = 0.35·R + 0.40·Rel + 0.25·Rep</span>
+            </div>
+            """, unsafe_allow_html=True)
 
     row = results[results['UserID'] == user_choice].iloc[0]
     label, badge_cls, desc = get_strategic_profile(row)
-    if generate_single_pdf:
-        st.session_state.current_screen = "report"
-    if generate_all_pdfs or clear_generated_pdfs:
-        st.session_state.current_screen = "pdf"
-    if send_pending_emails:
-        st.session_state.current_screen = "email"
+    avg_gi = results['Growth_Index'].mean()
+    rank = int(results['Growth_Index'].rank(ascending=False)[results['UserID'] == user_choice].values[0])
+    single_existing_pdf = st.session_state.generated_pdfs.get(user_choice)
+    saved_pdf_count = len(st.session_state.generated_pdfs)
 
-    screen_to_label = {
-        "report": "Report",
-        "pdf": "PDF Library",
-        "email": "Email Delivery",
-    }
-    label_to_screen = {label: screen for screen, label in screen_to_label.items()}
-    selected_label = st.segmented_control(
-        "View",
-        options=["Report", "PDF Library", "Email Delivery"],
-        default=screen_to_label[st.session_state.current_screen],
-        selection_mode="single",
+    render_panel_header(
+        "Single Report",
+        "Survey Response Workspace",
+        "Review one individual at a time, build PDFs in bulk, and handle email delivery from dedicated tabs instead of one long page.",
     )
-    st.session_state.current_screen = label_to_screen[selected_label]
+    top_a, top_b, top_c, top_d = st.columns(4)
+    with top_a:
+        render_small_metric("Participants", len(results))
+    with top_b:
+        single_progress_panel = st.empty()
+        render_progress_metric(single_progress_panel, saved_pdf_count, len(results))
+    with top_c:
+        render_small_metric("Pending Emails", pending_count)
+    with top_d:
+        render_small_metric("Cohort Avg GI", f"{avg_gi:.1f}")
 
-    if st.session_state.current_screen == "report":
+    report_tab, pdf_tab, email_tab = st.tabs(["Report", "PDF Library", "Email Delivery"])
+
+    with report_tab:
+        action_col, helper_col = st.columns([1.2, 1])
+        report_status_panel = st.empty()
+        with action_col:
+            generate_single_pdf = False
+            if single_existing_pdf and Path(single_existing_pdf["file_path"]).exists():
+                st.download_button(
+                    "Download Compiled PDF",
+                    Path(single_existing_pdf["file_path"]).read_bytes(),
+                    single_existing_pdf["file_name"],
+                    "application/pdf",
+                    use_container_width=True,
+                    key=f"download_compiled_{user_choice}",
+                )
+            else:
+                generate_single_pdf = st.button(
+                    "Compile Selected PDF",
+                    type="primary",
+                    use_container_width=True,
+                )
+        with helper_col:
+            render_info_card(
+                "Current Selection",
+                f"Previewing <b>{row['Display_Name']}</b>. Use this tab when you want to inspect one person first, then create a PDF for that person only.",
+            )
+
         st.markdown(f"""
         <div style='margin-bottom: 0.5rem; margin-top: 2rem;'>
             <div style='font-family: DM Mono, monospace; font-size: 0.7rem; color: #64748b; letter-spacing: 0.2em; text-transform: uppercase; margin-bottom: 0.3rem;'>
@@ -1391,6 +3671,7 @@ def run_app():
         st.markdown("<hr>", unsafe_allow_html=True)
 
         if generate_single_pdf:
+            report_status_panel.info(f"Compiling PDF for {row['Display_Name']}...")
             with st.spinner("Spinning up Playwright rendering engine..."):
                 try:
                     st.session_state.pdf_progress = {
@@ -1420,14 +3701,9 @@ def run_app():
                         "message": f"Generated selected PDF: {row['Display_Name']}",
                         "active": False,
                     }
+                    report_status_panel.success(f"Compiled PDF for {row['Display_Name']}.")
                     st.success("PDF rendered successfully!")
-                    st.download_button(
-                        label="⬇️ Download PDF",
-                        data=pdf_bytes,
-                        file_name=file_name,
-                        mime="application/pdf",
-                        use_container_width=True,
-                    )
+                    st.rerun()
                 except Exception as e:
                     st.session_state.pdf_progress = {
                         "current": 0,
@@ -1435,25 +3711,26 @@ def run_app():
                         "message": f"Selected PDF failed: {e}",
                         "active": False,
                     }
+                    report_status_panel.error(f"PDF compile failed for {row['Display_Name']}: {e}")
                     st.error(f"Render failed: {e}")
 
-    elif st.session_state.current_screen == "pdf":
+    with pdf_tab:
         pdf_progress_panel = st.empty()
         pdf_status_panel = st.empty()
         pdf_log_panel = st.empty()
         generated_list_panel = st.empty()
-        st.markdown(section_header("03", "PDF Library"), unsafe_allow_html=True)
-        st.markdown(
-            """
-            <div class="explain-wrap">
-                <div class="explain-sub">Batch Generator</div>
-                <div style="color:#334155; line-height:1.7;">
-                    Generate a reusable list of PDFs from the uploaded CSV. This section does not send email.
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        st.markdown(section_header("02", "PDF Library"), unsafe_allow_html=True)
+        action_left, action_mid, action_right = st.columns([1, 1, 1])
+        with action_left:
+            generate_all_pdfs = st.button("Generate PDFs For All Rows", use_container_width=True)
+        with action_mid:
+            clear_generated_pdfs = st.button("Clear Generated PDF List", use_container_width=True)
+        with action_right:
+            render_info_card(
+                "Library Scope",
+                "This library is tied to the currently uploaded CSV only. Running batch generation rebuilds the full survey set from scratch so the saved count always stays aligned.",
+            )
+
         st.caption(f"Rows available in uploaded CSV: {len(results)}")
         if st.session_state.pdf_progress["total"]:
             progress_total = max(st.session_state.pdf_progress["total"], 1)
@@ -1473,34 +3750,19 @@ def run_app():
             st.session_state.pdf_batch_log = []
             st.session_state.pdf_progress = {"current": 0, "total": 0, "message": "", "active": False}
             clear_generated_pdf_library(st.session_state.current_library_key)
+            render_progress_metric(single_progress_panel, 0, len(results))
             st.success("Cleared generated PDF list.")
 
         if generate_all_pdfs:
             total_reports = len(results)
-            existing_user_ids = {
-                user_id for user_id in st.session_state.generated_pdfs.keys()
-                if user_id in set(results["UserID"].tolist())
-            }
-            pending_reports = [
-                report_row for _, report_row in results.iterrows()
-                if report_row["UserID"] not in existing_user_ids
-            ]
+            st.session_state.generated_pdfs = {}
+            clear_generated_pdf_library(st.session_state.current_library_key)
+            render_progress_metric(single_progress_panel, 0, total_reports)
             batch_log = []
-            generated_count = len(existing_user_ids)
+            generated_count = 0
 
-            if not pending_reports:
-                st.session_state.pdf_progress = {
-                    "current": total_reports,
-                    "total": total_reports,
-                    "message": f"All {total_reports} PDFs are already generated for this uploaded list.",
-                    "active": False,
-                }
-                pdf_progress_panel.progress(1.0, text=f"Generating PDFs: {total_reports}/{total_reports}")
-                pdf_status_panel.success(st.session_state.pdf_progress["message"])
-
-            for offset, report_row in enumerate(pending_reports, start=1):
-                position = len(existing_user_ids) + offset
-                current_name = report_row["Display_Name"]
+            for position, (_, report_row) in enumerate(results.iterrows(), start=1):
+                current_name = resolve_record_display_name(report_row, fallback=f"User {position}")
                 st.session_state.pdf_progress = {
                     "current": position,
                     "total": total_reports,
@@ -1515,20 +3777,25 @@ def run_app():
                     contact = get_row_contact_details(raw, results, pdf_user)
                     st.session_state.generated_pdfs[pdf_user] = save_generated_pdf_record(
                         pdf_user,
-                        build_pdf_filename(report_row["Display_Name"]),
+                        build_pdf_filename(current_name),
                         pdf_bytes,
                         st.session_state.current_library_key,
                         email=contact["email"],
-                        name=contact["name"],
+                        name=resolve_record_display_name(
+                            {"name": contact["name"], "Display_Name": current_name, "email": contact["email"], "UserID": pdf_user},
+                            fallback=current_name,
+                        ),
                     )
                     persist_generated_pdf_library(
                         st.session_state.generated_pdfs,
                         st.session_state.current_library_key,
                     )
                     generated_count += 1
+                    render_progress_metric(single_progress_panel, generated_count, total_reports)
                     batch_log.append(f"{position}/{total_reports} generated: {current_name}")
-                    render_generated_pdf_library(generated_list_panel)
+                    render_generated_pdf_library(generated_list_panel, report_type="single")
                 except Exception as e:
+                    render_progress_metric(single_progress_panel, generated_count, total_reports)
                     batch_log.append(f"{position}/{total_reports} failed: {current_name} ({e})")
 
             st.session_state.pdf_batch_log = batch_log
@@ -1546,25 +3813,26 @@ def run_app():
                 for line in st.session_state.pdf_batch_log[-10:]:
                     st.write(f"- {line}")
 
-        render_generated_pdf_library(generated_list_panel)
+        render_generated_pdf_library(generated_list_panel, report_type="single")
 
-    elif st.session_state.current_screen == "email":
+    with email_tab:
         email_progress_panel = st.empty()
         email_status_panel = st.empty()
         email_log_panel = st.empty()
-        st.markdown(section_header("05", "Email Delivery"), unsafe_allow_html=True)
-        st.markdown(
-            """
-            <div class="explain-wrap">
-                <div class="explain-sub">Batch Sender</div>
-                <div style="color:#334155; line-height:1.7;">
-                    Send PDFs directly as email attachments for every row in the uploaded CSV where the status is <b>Pending</b>.
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.caption(f"Pending rows available: {pending_count}")
+        st.markdown(section_header("03", "Email Delivery"), unsafe_allow_html=True)
+        email_action_col, email_help_col = st.columns([1, 1.1])
+        with email_action_col:
+            send_pending_emails = st.button("Send Bulk Emails", use_container_width=True)
+        with email_help_col:
+            render_info_card(
+                "Batch Sender",
+                "This tab sends PDFs as email attachments for all rows marked <b>Pending</b> in the uploaded CSV. Progress stays visible here while the bulk run is in progress.",
+            )
+        metric_a, metric_b = st.columns(2)
+        with metric_a:
+            render_small_metric("Pending Rows", pending_count)
+        with metric_b:
+            render_small_metric("Email Mode", "Bulk Send")
 
         if send_pending_emails:
             with st.spinner("Generating PDFs and sending emails..."):
@@ -1603,6 +3871,7 @@ def run_app():
                     st.error(f"Email sending failed: {e}")
 
         if st.session_state.email_batch_log:
+            st.markdown("**Recent Email Activity**")
             with email_log_panel.container():
                 for line in st.session_state.email_batch_log[-10:]:
                     st.write(f"- {line}")
