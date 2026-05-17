@@ -3,6 +3,8 @@ import os
 from typing import List
 from pathlib import Path
 from typing import Callable
+import smtplib
+from email.message import EmailMessage
 
 import pandas as pd
 import requests
@@ -33,11 +35,19 @@ load_local_env()
 
 CONFIG = {
     "zepto_api_key": os.environ.get("ZEPTO_API_KEY", ""),
+    "smtp_host": os.environ.get("SMTP_HOST", ""),
+    "smtp_port": os.environ.get("SMTP_PORT", ""),
+    "smtp_username": os.environ.get("SMTP_USERNAME", ""),
+    "smtp_password": os.environ.get("SMTP_PASSWORD", ""),
     "from_email": os.environ.get("FROM_EMAIL", "events@edxso.com"),
     "from_name": os.environ.get("FROM_NAME", "Team EDXSO"),
     "subject": os.environ.get(
         "EMAIL_SUBJECT",
         "Your School Evolution Score Report | Chhattisgarh Leadership Summit",
+    ),
+    "certificate_subject": os.environ.get(
+        "CERTIFICATE_EMAIL_SUBJECT",
+        "Thank You for Attending the CBA Session | Participation Certificate & Exclusive Workshop Invitation",
     ),
 }
 
@@ -84,6 +94,40 @@ EMAIL_TEMPLATE = """\
 </html>
 """
 
+CERTIFICATE_EMAIL_TEMPLATE = """\
+<!DOCTYPE html>
+<html>
+  <body style="font-family: Arial, sans-serif; line-height: 1.7; color: #222;">
+    <p>Respected Educator,<br>Namaste!</p>
+
+    <p>
+      Thank you for being a part of our interactive session on
+      <strong>Competency-Based Assessment (CBA)</strong>{date_fragment}.
+      We truly appreciate your enthusiastic participation and engagement throughout the session.
+    </p>
+
+    <p>
+      We hope the session provided valuable insights into competency-based teaching,
+      learning, and assessment practices aligned with NEP recommendations.
+    </p>
+
+    <p><strong>Please find attached your Participation Certificate for the session.</strong></p>
+
+    <p>
+      We look forward to your continued participation in our teacher capacity-building initiatives.
+    </p>
+
+    <p>
+      Warm regards,<br>
+      Nidhi Jaiswal<br>
+      Manager Education Solution<br>
+      EDXSO<br>
+      6299443670
+    </p>
+  </body>
+</html>
+"""
+
 
 def require_config(name: str) -> str:
     value = CONFIG[name]
@@ -97,6 +141,11 @@ def require_config(name: str) -> str:
 def render_email_html(name: str) -> str:
     participant_name = (name or "Participant").strip()
     return EMAIL_TEMPLATE.format(name=participant_name)
+
+
+def render_certificate_email_html(event_date: str) -> str:
+    date_fragment = f" conducted on {event_date}" if (event_date or "").strip() else ""
+    return CERTIFICATE_EMAIL_TEMPLATE.format(date_fragment=date_fragment)
 
 
 def build_pdf_filename(display_name: str) -> str:
@@ -126,12 +175,58 @@ def get_series_value(row: pd.Series, index: int, column_name: str | None, defaul
     return str(value).strip()
 
 
-def send_email_with_attachment(email: str, name: str, file_name: str, file_bytes: bytes):
+class SimpleSendResponse:
+    def __init__(self, status_code: int, text: str):
+        self.status_code = status_code
+        self.text = text
+
+
+def smtp_is_configured() -> bool:
+    return all(
+        [
+            CONFIG.get("smtp_host"),
+            CONFIG.get("smtp_port"),
+            CONFIG.get("smtp_username"),
+            CONFIG.get("smtp_password"),
+            CONFIG.get("from_email"),
+        ]
+    )
+
+
+def send_email_with_smtp(email: str, name: str, file_name: str, file_bytes: bytes, subject: str, html_body: str):
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f"{CONFIG['from_name']} <{CONFIG['from_email']}>"
+    msg["To"] = f"{name} <{email}>" if name else email
+    msg.set_content(
+        "Please view this email in HTML format to read the full message and access the attached report."
+    )
+    msg.add_alternative(html_body, subtype="html")
+    msg.add_attachment(file_bytes, maintype="application", subtype="pdf", filename=file_name)
+
+    smtp_port = int(str(CONFIG["smtp_port"]).strip())
+    with smtplib.SMTP(CONFIG["smtp_host"], smtp_port, timeout=60) as server:
+        server.ehlo()
+        if smtp_port == 587:
+            server.starttls()
+            server.ehlo()
+        server.login(CONFIG["smtp_username"], CONFIG["smtp_password"])
+        server.send_message(msg)
+
+    return SimpleSendResponse(200, "Sent via SMTP")
+
+
+def send_email_with_attachment(email: str, name: str, file_name: str, file_bytes: bytes, subject: str | None = None, html_body: str | None = None):
+    subject = subject or CONFIG["subject"]
+    html_body = html_body or render_email_html(name)
+    if smtp_is_configured():
+        return send_email_with_smtp(email, name, file_name, file_bytes, subject, html_body)
+
     payload = {
         "from": {"address": CONFIG["from_email"], "name": CONFIG["from_name"]},
         "to": [{"email_address": {"address": email, "name": name or ""}}],
-        "subject": CONFIG["subject"],
-        "htmlbody": render_email_html(name),
+        "subject": subject,
+        "htmlbody": html_body,
         "attachments": [
             {
                 "name": file_name,
@@ -149,6 +244,23 @@ def send_email_with_attachment(email: str, name: str, file_name: str, file_bytes
         },
         json=payload,
         timeout=60,
+    )
+
+
+def send_certificate_email_with_attachment(
+    email: str,
+    name: str,
+    file_name: str,
+    file_bytes: bytes,
+    event_date: str = "",
+):
+    return send_email_with_attachment(
+        email=email,
+        name=name,
+        file_name=file_name,
+        file_bytes=file_bytes,
+        subject=CONFIG["certificate_subject"],
+        html_body=render_certificate_email_html(event_date),
     )
 
 
